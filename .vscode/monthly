@@ -1,0 +1,514 @@
+
+#!/usr/local/bin/python3
+import csv
+import io
+import logging
+from datetime import datetime, timedelta, date
+import pandas as pd
+import numpy as np
+import boto3
+import re
+
+import pyspark.sql.functions as f
+from pyspark.sql.functions import col, lit, to_date, date_format
+from pyspark.sql import SQLContext
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+CSV_BUFFER = io.StringIO()
+sc = SparkContext()
+glueContext = GlueContext(sc)
+logger = glueContext.get_logger()
+spark = glueContext.spark_session
+sqlcontext = SQLContext(sc)
+
+S3 = boto3.client('s3')
+S3RESOURCE = boto3.resource('s3')
+env = 'prod'
+YEAR = datetime.strftime(datetime.now(), '%Y')
+print(YEAR)
+CURR_DT = datetime.now()
+#CURR_DT = datetime(2025, 2, 28, 23, 45, 29, 431717)
+LAST_REFRESHED_DT = datetime.strftime(CURR_DT, '%Y-%m-%d %H:%M:%S')
+CURR_YEAR = datetime.strftime(CURR_DT, '%Y')
+MONTH = datetime.strftime(CURR_DT, '%m')
+CURR_MONTHID = datetime.strftime(CURR_DT, '%m%Y')
+#YEAR = datetime.strftime(CURR_DT, '%Y')
+SRCBUCKET = 'victoria-prd-eu-lambda'
+WH_BUCKET = 'victoria-prd-s3-eu-warehouse'
+
+TRTPATH = 'ioengage/data/aameo/{0}/csv/TERRITORY2/'.format(env)
+USRPATH = 'ioengage/data/aameo/{0}/csv/USER/'.format(env)
+PERPATH = 'ioengage/data/aameo/{0}/csv/OCE__PERIOD__C/'.format(env)
+PCPATH = 'ioengage/data/aameo/{0}/csv/OCE__PLANCYCLE__C/'.format(env)
+APPATH = 'ioengage/data/aameo/{0}/csv/OCE__ACTIVITYPLAN__C/'.format(env)
+AGPATH = 'ioengage/data/aameo/{0}/csv/OCE__ACCOUNTGOAL__C/'.format(env)
+OCPPATH = 'ioengage/aameo/ocp/OCP-DATA-{}.xlsx'.format(YEAR)
+EMAIL_TR_PATH = 'ioengage/data/aameo/{0}/csv/OCE__EMAILTRANSACTION__C/'.format(env)
+EMAIL_TEMP_PATH = 'ioengage/data/aameo/{0}/csv/OCE__EMAILTEMPLATE__C/'.format(env)
+TC_PATH = 'ioengage/data/aameo/{0}/csv/wh-target-class/wh-target-class.csv'.format(env)
+AFFPATH = 'ioengage/data/aameo/{0}/csv/wh-affiliate/affiliate.csv'.format(env)
+
+
+TRT_COLS = (['Id', 'Name', 'MirrorTerritory__c', 'UserNameOfMirrorTerritory__c', \
+'ParentTerritory2Id', 'SystemModstamp', 'NNAE_Territory_type__c', 'NNAE_Organization__c'])
+USR_COLS = (['OCE__IsLoggingEnabled__c', 'ManagerId', 'Id', 'Username', 'LastName', \
+'TimeZoneSidKey', 'FirstName', 'Name', 'CompanyName', 'Division', 'Department', 'Title', \
+'Street', 'City', 'State', 'PostalCode', 'Country', 'Latitude', 'Longitude', 'Email', 'Alias', \
+'IsActive', 'ProfileId', 'LanguageLocaleKey', 'EmployeeNumber','LastModifiedDate'])
+PROF_COLS = ['Id', 'Name']
+OCP_TC_COLS = ['Target Class', 'Sub Target Class']
+CALL_COLS = (['Id', 'OCE__CallType__c', 'OCE__Status__c', 'OCE__Account__c', 'OwnerId', \
+'OCE__CallDateTime__c', 'OCE__EndCallDateTime__c', 'CreatedDate', 'OCE__SubmissionDate__c', \
+'NNEU_Core_CallNotes__c', 'OCE__NextCallObjective__c', 'OCE__Territory__c', 'OCE__Channel__c', \
+'NNAAMEO_Accompanied_By__c', 'LastModifiedDate', 'IsDeleted', 'NNAE_Call_Type__c', \
+'NNAE_Call_Type_2__c', 'Name', 'RecordTypeId', 'OCE__InvitationStatus__c', 'OCE__ParentCall__c', \
+'NNAE_Total_number_of_Attendees__c', 'NNAE_Off_Label_Call_Note__c', 'OCE__DurationPicklist__c', \
+'OCE__OfflineCreatedByID__c', 'CreatedById', 'OCE__IsGroupCall__c', 'OCE__Meeting__c'])
+PER_COLS = ['Id', 'OCE__StartDate__c']
+PC_COLS = ['Id', 'OCE__Period__c', 'OCE__Territory__c', 'OwnerId']
+AP_COLS = (['OCE__AccountGoal__c', 'OCE__HQGoal__c', 'NNAE_Sub_target_Class__c', \
+'OCE__ActivityPlanConfigName__c', 'NNAE_Target_Class__c', 'NNAE_Therapy_Area_Product__c', \
+'OCE__Actual__c', 'Id'])
+AG_COLS = ['OCE__Account__c', 'OCE__PlanCycle__c', 'Id']
+EMAIL_TR_COLS = (['Id', 'CreatedDate', 'OwnerId', 'IsDeleted', 'OCE__Account__c', 'Name', \
+'OCE__AttachmentNames__c', 'OCE__EmailBouncedDate__c', 'OCE__EmailBouncedReason__c', \
+'OCE__EmailResponseStatus__c', 'OCE__EmailStatus__c', 'OCE__EmailStatusDate__c', \
+'OCE__EmailTemplate__c', 'OCE__FirstOpenedDate__c', 'OCE__LastClickedDate__c', \
+'OCE__LastOpenedDate__c', 'OCE__LatestTrackingEventDate__c', 'OCE__MessageStatus__c', \
+'OCE__Sender__c', 'OCE__SentDate__c', 'OCE__SentTo__c', 'OCE__Subject__c', \
+'OCE__EmailQueue__c', 'OCE__TimesOpened__c'])
+EMAIL_TEMP_COLS = (['Id', 'Name', 'OCE__Product__c', 'OCE__Description__c', 'OCE__Topic__c', \
+'OCE__AttachICSFile__c', 'OCE__EndDate__c', 'OCE__IsActive__c'])
+MCQ_COLS = ['Affiliate','Channel','Status','Month_Id','Contact','MCQs']
+LANG_COLS = ['Value', 'Language_code', 'Translation', 'Object', 'Field']
+AFF_COLS = (['AFFILIATE_ID', 'ORGANIZATION', 'LANGUAGE', 'COUNTRY', 'AFFILIATE', 'REGION', \
+'BUSINESS_AREA'])
+
+if MONTH == '01':
+    PREV_MONTH = 12
+    PREV_YEAR = pd.to_numeric(datetime.strftime(CURR_DT, '%Y'), errors='coerce') - 1
+else:
+    PREV_MONTH = pd.to_numeric(datetime.strftime(CURR_DT, '%m'), errors='coerce') - 1
+    PREV_YEAR = CURR_YEAR
+
+PRE_PREV_DT = (date(int(PREV_YEAR),int(PREV_MONTH),1) - timedelta(days=1)).strftime('%Y-%m-%d')
+
+PREV_MONTHID = str(PREV_MONTH)+str(PREV_YEAR)
+PREV_MONTHID = pd.to_datetime(PREV_MONTHID, format='%m%Y').strftime('%m%Y')
+
+
+def csv_dataframe(prefix, encoding, columns):
+    s3resource = boto3.resource('s3')
+    bucket = s3resource.Bucket(SRCBUCKET)
+    prefix_objs = bucket.objects.filter(Prefix=prefix)
+    prefix_df = []
+    filter_cols = ['Id', 'LastModifiedDate']
+    for obj in prefix_objs:
+        if '.csv' in obj.key:
+            body = obj.get()['Body'].read().decode(encoding)
+            df = (pd.read_csv(io.StringIO(body), quotechar='"', sep='\t', dtype='str', \
+            on_bad_lines='skip', usecols=columns+filter_cols))
+            prefix_df.append(df)
+    DF = pd.concat(prefix_df).sort_values(by='LastModifiedDate')
+    DF = DF.drop_duplicates(['Id'], keep='last')[columns]
+    return DF
+
+def uploadCSV(OBJ_PATH, FINAL_DF):
+#Make sure that boto3 module is imported and s3 resource is referred
+    DESTBUCKET = WH_BUCKET
+    DESTMASTERPATH = 'ioengage/data/aameo/{0}/csv/'.format(env)
+    if not FINAL_DF.empty:
+        csv_buffer = io.StringIO()
+        (FINAL_DF.to_csv(csv_buffer, sep=',', quotechar='"', encoding='utf-8', quoting=csv.QUOTE_ALL, \
+        index=False))
+        S3RESOURCE.Object(DESTBUCKET, DESTMASTERPATH+OBJ_PATH).put(Body=csv_buffer.getvalue())
+        print("loaded "+OBJ_PATH)
+    else:
+        print(OBJ_PATH+' is Empty')
+OCP_DATA = S3.get_object(Bucket='victoria-prd-s3-eu-reference', Key=OCPPATH)
+OCP_CONTENTS = OCP_DATA['Body'].read()
+OCP_CP_DF = (pd.read_excel(io.BytesIO(OCP_CONTENTS),  \
+sheet_name='CALL PLAN TARGETS'))
+TA_PRD_DF = (pd.read_excel(io.BytesIO(OCP_CONTENTS),  \
+sheet_name='THERAPY_AREA_TO_PRODUCT'))
+TA_PRD_DF.columns = ['Therapy_Area', 'Product_Name']
+UP_AREA_DF = (pd.read_excel(io.BytesIO(OCP_CONTENTS),  \
+sheet_name='USER_PROFILE_TO_PERSONA'))
+MCQ_DF = (pd.read_excel(io.BytesIO(OCP_CONTENTS),  \
+sheet_name='MCQ'))
+MCQ_AFF_List = MCQ_DF['Affiliate'].unique()
+
+bucket1 = boto3.resource('s3').Bucket(WH_BUCKET)
+TRT_D_objs = bucket1.objects.filter(Prefix='ioengage/data/aameo/{0}/csv/wh-territory-d/'.format(env))
+TRT_prefix_df = []
+for obj in TRT_D_objs:
+    if '.csv' in obj.key:
+        body = obj.get()['Body'].read().decode('utf-8')
+        df = (pd.read_csv(io.StringIO(body), quotechar='"', sep=',', dtype='str', \
+        on_bad_lines='skip'))
+        TRT_prefix_df.append(df)
+
+TC_OBJ = S3.get_object(Bucket=WH_BUCKET, Key=TC_PATH)
+TC_STRING = TC_OBJ['Body'].read().decode('utf-8')
+TC_DF = (pd.read_csv(io.StringIO(TC_STRING), quotechar='"', sep=',', on_bad_lines='skip', \
+dtype=str))
+TC_DF.columns = ['TARGETCLASS_ID', 'TARGET_CLASS', 'SUB_TARGET_CLASS', 'LAST_REFRESHED_DATE']
+
+AFF_OBJ = S3.get_object(Bucket=WH_BUCKET, Key=AFFPATH)
+AFF_STRING = AFF_OBJ['Body'].read().decode('utf-8')
+AFF_DF = (pd.read_csv(io.StringIO(AFF_STRING), quotechar='"', sep=',', on_bad_lines='skip', \
+usecols=AFF_COLS, dtype=str).drop_duplicates())
+
+LOC_LAN_OBJ = (S3.get_object(Bucket='victoria-prd-s3-eu-reference', \
+Key='ioengage/aameo/admin/AAMEO-LANGUAGE-TRANSLATION.csv'))
+LOC_LAN_STR = LOC_LAN_OBJ['Body'].read().decode('utf-8')
+LOC_LAN_DF = (pd.read_csv(io.StringIO(LOC_LAN_STR), quotechar='"', sep=',', on_bad_lines='skip', \
+usecols=LANG_COLS, dtype=str).drop_duplicates())
+
+TRT_FD_HIST_DF = (pd.concat(TRT_prefix_df).sort_values(by='MONTH_ID')[['Name', 'UserId', 'MONTH_ID', \
+'LastModifiedDate']].drop_duplicates())
+TRT_HIST_DF = TRT_FD_HIST_DF[['Name', 'UserId', 'MONTH_ID']].drop_duplicates()
+TRT_HIST_DF.columns = ['TERRITORY', 'OCE__User__c', 'MONTH_ID']
+
+def wc_call_acc_a():
+    """Function to create WC_CALL_ACC_A TABLE"""
+    CALL_DF = spark.read.option("header", True).option("delimiter","\t").format("csv").load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__CALL__C/*.csv".format(env)).select(CALL_COLS)
+    CALL_DF = CALL_DF.where(col("OCE__CallDateTime__c") > lit(PRE_PREV_DT))
+    #CALL_DF = CALL_DF.where((col("OCE__CallDateTime__c") > lit("2022-08-31"))&(col("OCE__CallDateTime__c") < lit("2022-09-30")))
+    CALL_DF = CALL_DF.toPandas()
+    print(CALL_DF.shape)
+    CALL_INT_DF = (CALL_DF[CALL_DF['NNAE_Call_Type__c'].isin(['Promotional'])\
+    &CALL_DF['OCE__Status__c'].isin(['Submitted'])][['Id', 'OCE__Account__c', \
+    'OCE__Territory__c', 'OCE__CallDateTime__c', 'OCE__OfflineCreatedByID__c', 'OCE__Channel__c']]\
+    .drop_duplicates())
+    print(CALL_INT_DF.shape)
+    USER_DF = csv_dataframe(USRPATH, 'utf-8', ['Id', 'Country', 'LanguageLocaleKey', 'TimeZoneSidKey'])
+    USER_DF = USER_DF.rename({'Id':'User_Id', 'LanguageLocaleKey':'Language_code'}, axis=1)
+    CALL_INT_DF = (pd.merge(CALL_INT_DF, USER_DF[['User_Id', 'TimeZoneSidKey']], \
+    left_on='OCE__OfflineCreatedByID__c', right_on='User_Id', how='left')\
+    .drop('User_Id', axis=1))
+    CALL_INT_DF['TimeZoneSidKey'] = CALL_INT_DF['TimeZoneSidKey'].fillna('UTC')
+    CALL_INT_DF['OCE__CallDateTime__c'] = pd.to_datetime(CALL_INT_DF['OCE__CallDateTime__c'])
+    CALL_INT_DF['OCE__CallDateTime__c'] =  (CALL_INT_DF.groupby('TimeZoneSidKey')['OCE__CallDateTime__c']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    CALL_INT_DF['Month_Id'] = CALL_INT_DF['OCE__CallDateTime__c'].apply(lambda x: x.strftime('%m%Y'))
+    CALL_INT_DF['Status'] = 'Submitted'
+    print(CALL_INT_DF.shape)
+    CALL_INT_DF['ACTUAL_CALL'] = 1
+    CALL_GRP_DF = (CALL_INT_DF.groupby(['OCE__Account__c', 'OCE__Territory__c', \
+    'OCE__Channel__c', 'Month_Id', 'Status'], as_index=False)\
+    .agg({'ACTUAL_CALL':sum}))
+    CALL_GRP_DF.columns = (['ACCOUNT_ID', 'TERRITORY', 'Channel', 'Month_Id', 'Status', \
+    'ACTUAL_CALL'])
+    print("1")
+    #CALL_GRP_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy6.csv', index=False)
+    EMAIL_TR_DF = csv_dataframe(EMAIL_TR_PATH, 'utf-8', ['Id', 'OwnerId', 'OCE__Account__c','OCE__SentDate__c','OCE__EmailStatus__c','OCE__EmailTemplate__c'])
+    check_status = ['Opened','Sent','Clicked']
+    EMAIL_CHK_DF = EMAIL_TR_DF[EMAIL_TR_DF['OCE__EmailStatus__c'].isin(check_status)].drop_duplicates()
+    EMAIL_TEMPLATE_DF = csv_dataframe(EMAIL_TEMP_PATH, 'utf-8', ['Id', 'OCE__AttachICSFile__c'])
+    EMAIL_TEMPLATE_DF = EMAIL_TEMPLATE_DF.rename({'Id':'Template_Id'}, axis=1)
+    EMAIL_TEMP_DF = pd.merge(EMAIL_CHK_DF,EMAIL_TEMPLATE_DF[EMAIL_TEMPLATE_DF['OCE__AttachICSFile__c'].isin(['False'])], left_on='OCE__EmailTemplate__c', right_on='Template_Id', how='inner').drop_duplicates()
+    EMAIL_TEMP_DF = EMAIL_TEMP_DF.drop(['Template_Id','OCE__EmailTemplate__c','OCE__AttachICSFile__c'], axis=1)
+    #EMAIL_TEMP_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy_temp1.csv', index=False)
+    EMAIL_TEMP_DF['Channel'] = 'Approved Email (RTE)'
+    EMAIL_TEMP_DF['MONTH_ID'] = (pd.to_datetime(EMAIL_TEMP_DF['OCE__SentDate__c'])\
+    .apply(lambda x: x.strftime('%m%Y')))
+    print("2")
+    EMAIL_TEMP_DF = EMAIL_TEMP_DF.rename({'Id':'EML_Id','OCE__Account__c':'EML_OCE__Account__c','OwnerId':'OCE__User__c'}, axis=1)
+    EMAIL_TRT_DF = pd.merge(EMAIL_TEMP_DF,TRT_HIST_DF, on=['OCE__User__c', 'MONTH_ID'], how='left').drop_duplicates()
+    #EMAIL_TRT_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy_temp2.csv', index=False)
+    EMAIL_TRT_DF = EMAIL_TRT_DF.drop(['EML_Id','OCE__SentDate__c','OCE__User__c'], axis=1)
+    EMAIL_TRT_DF['ACTUAL_CALL'] = 1
+    EMAIL_TRT_FIN_DF = (EMAIL_TRT_DF.groupby(['EML_OCE__Account__c','OCE__EmailStatus__c','Channel','MONTH_ID','TERRITORY'], as_index=False)\
+    .agg({'ACTUAL_CALL':sum}).drop_duplicates())
+    print("3")
+    #EMAIL_TRT_FIN_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy_temp3.csv', index=False)
+    EMAIL_TRT_FIN_DF.columns = (['ACCOUNT_ID','Status','Channel','Month_Id','TERRITORY','ACTUAL_CALL'])
+    EMAIL_FULL_DF = pd.concat([CALL_GRP_DF,EMAIL_TRT_FIN_DF], ignore_index=True).drop_duplicates()
+    TRT_INIT_DF = csv_dataframe(TRTPATH, 'utf-8', ['Name', 'NNAE_Organization__c'])
+    TRT_INIT_DF = TRT_INIT_DF.rename({'Name':'TERRITORY','NNAE_Organization__c':'Affiliate'}, axis=1)
+    EMAIL_FIN_DF = pd.merge(EMAIL_FULL_DF, TRT_INIT_DF, on = 'TERRITORY', how='left').drop_duplicates()
+    #EMAIL_FIN_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy7.csv', index=False)
+    MCQ_TEMP_DF = EMAIL_FIN_DF[EMAIL_FIN_DF['Affiliate'].isin(MCQ_AFF_List)]
+    print("4")
+    #MCQ_TEMP_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy8.csv', index=False)
+    MCQ_CHA_DF = EMAIL_FIN_DF[EMAIL_FIN_DF['Affiliate'].isin(MCQ_AFF_List) == False]
+    MCQ_CHA_DF = MCQ_CHA_DF[MCQ_CHA_DF['Channel'] !='Approved Email (RTE)']
+    #MCQ_CHA_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy9.csv', index=False)
+    MCQ_CHA_DF = MCQ_CHA_DF.drop(['Status','Affiliate'], axis=1)
+    MCQ_DF['Month_Id'] = (pd.to_datetime(MCQ_DF['Month_Id'])\
+    .apply(lambda x: x.strftime('%m%Y')))
+    MCQ_TEMP2_DF = pd.merge(MCQ_TEMP_DF, MCQ_DF, on=['Affiliate','Channel','Status','Month_Id'], how='left')
+    MCQ_TEMP2_DF['Weighted_Actual'] = MCQ_TEMP2_DF.MCQs * MCQ_TEMP2_DF.ACTUAL_CALL  
+    MCQ_TEMP2_DF = MCQ_TEMP2_DF.drop(['ACTUAL_CALL','Status','Affiliate','Contact','MCQs'], axis=1)
+    MCQ_TEMP2_DF['Total_Weighted_Actual'] = MCQ_TEMP2_DF.groupby(['ACCOUNT_ID','Month_Id','TERRITORY'])['Weighted_Actual'].transform('sum')
+    MCQ_FIN_DF = (MCQ_TEMP2_DF.pivot_table(index=['ACCOUNT_ID', 'TERRITORY', 'Month_Id','Total_Weighted_Actual'], \
+    columns='Channel', values='Weighted_Actual').reset_index()).fillna(0)
+    MCQ_FIN_DF['CHANNEL'] = ''
+    print("5")
+    print(MCQ_CHA_DF.columns)
+    MCQ_CHA_DF.columns = (['ACCOUNT_ID','TERRITORY','CHANNEL','MONTH_ID','ACTUAL_CALL'])
+    MCQ_FIN_DF = MCQ_FIN_DF.rename({'Month_Id':'MONTH_ID','Total_Weighted_Actual':'ACTUAL_CALL'}, axis=1)
+    print("6")
+    #MCQ_CHA_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy2.csv', index=False)
+    #MCQ_FIN_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy3.csv', index=False)
+    
+    PER_DF = (csv_dataframe(PERPATH, 'utf-8', ['Id', 'OCE__StartDate__c', 'OCE__EndDate__c'])\
+    .loc[lambda df: (df['OCE__StartDate__c'].str.contains(YEAR)|df['OCE__StartDate__c'].str.contains(str(PREV_YEAR))), :])
+    AP_DF = csv_dataframe(APPATH, 'utf-8', AP_COLS)
+    AG_DF = csv_dataframe(AGPATH, 'utf-8', AG_COLS)
+    PC_DF = csv_dataframe(PCPATH, 'utf-8', PC_COLS)
+    PER_DF.columns = ['PERIOD_ID', 'PERIOD_START_DT', 'PERIOD_END_DT']
+    PER_DF['NB_MONTHS'] = ((pd.to_datetime(PER_DF['PERIOD_END_DT']) - pd.to_datetime(PER_DF['PERIOD_START_DT']))/np.timedelta64(1, 'M'))
+    PER_DF['NB_MONTHS'] = round(PER_DF['NB_MONTHS'])
+    PER_DF1 = pd.concat([pd.Series(r.PERIOD_ID,pd.date_range(r.PERIOD_START_DT, r.PERIOD_END_DT, freq='MS')) 
+                     for r in PER_DF.itertuples()]).reset_index()
+    PER_DF1.columns = ['PERIOD_START_DT','PERIOD_ID']
+    PER_DF = pd.merge(PER_DF[['PERIOD_ID', 'NB_MONTHS']].drop_duplicates(), PER_DF1, on='PERIOD_ID', how='left')
+    AP_DF.columns = (['ACCOUNT_GOAL_ID', 'TARGET_CALL', 'SUB_TARGET_CLASS', 'CHANNEL', \
+    'TARGET_CLASS', 'TA_ID', 'ACTUAL_CALL', 'ACTIVITY_PLAN_ID'])
+    AG_DF.columns = ['ACCOUNT_ID', 'PLAN_CYCLE_ID', 'ACCOUNT_GOAL_ID']
+    PC_DF.columns = ['PLAN_CYCLE_ID', 'PERIOD_ID', 'TERRITORY', 'OWNER_ID']
+    USRAFF_DF = (pd.merge(USER_DF, AFF_DF[['AFFILIATE_ID', 'ORGANIZATION']], \
+    left_on='Country', right_on='ORGANIZATION', how='left')\
+    .drop(['ORGANIZATION', 'Country'], axis=1))
+    AP_DF['SUB_TARGET_CLASS'] = AP_DF['SUB_TARGET_CLASS'].fillna('T')
+    AP_TC_DF = (pd.merge(AP_DF, TC_DF.drop_duplicates(), left_on=['SUB_TARGET_CLASS', 'TARGET_CLASS'], \
+    right_on=['SUB_TARGET_CLASS', 'TARGET_CLASS'])\
+    .drop(['SUB_TARGET_CLASS', 'TARGET_CLASS', 'ACTUAL_CALL'], axis=1))
+    PC_PER_DF = pd.merge(PC_DF, PER_DF, left_on='PERIOD_ID', right_on='PERIOD_ID')
+    AG_PC_PER_DF = (pd.merge(AG_DF, PC_PER_DF, left_on='PLAN_CYCLE_ID', right_on='PLAN_CYCLE_ID')\
+    .drop(['PLAN_CYCLE_ID'], axis=1))
+    AP_AGG_DF = (pd.merge(AP_TC_DF, AG_PC_PER_DF, left_on='ACCOUNT_GOAL_ID', \
+    right_on='ACCOUNT_GOAL_ID').drop(['ACCOUNT_GOAL_ID'], axis=1))
+    AP_INT_DF = (pd.merge(AP_AGG_DF, USRAFF_DF, left_on='OWNER_ID', right_on='User_Id', \
+    how='left').drop(['User_Id'], axis=1))
+    AP_INT_DF['MONTH_ID'] = (pd.to_datetime(AP_INT_DF['PERIOD_START_DT'])\
+    .apply(lambda x: x.strftime('%m%Y')))
+    AP_INT_DF['YEAR'] = (pd.to_datetime(AP_INT_DF['PERIOD_START_DT'])\
+    .apply(lambda x: x.strftime('%Y')))
+    AP_INT_DF['TARGET_CALL'] = AP_INT_DF['TARGET_CALL'].astype(float)/AP_INT_DF['NB_MONTHS']
+    AP_INT_DF['TARGET_CALL'] = AP_INT_DF['TARGET_CALL'].fillna(0)
+    AP_INT_DF['TARGET_CALL'] = AP_INT_DF['TARGET_CALL'].round(decimals = 2)
+    AP_INT_DF['CHANNEL'] = AP_INT_DF['CHANNEL'].fillna('Face To Face')
+    AP_INT_DF.loc[AP_INT_DF['CHANNEL'].str.contains('Face'), 'CHANNEL'] = 'Face To Face'
+    AP_INT_DF.loc[AP_INT_DF['CHANNEL'].isin(['MSTeams']), 'CHANNEL'] = 'MS Teams'
+    AP_INT_DF.loc[AP_INT_DF['CHANNEL'].isin(['NRx']), 'CHANNEL'] = 'NRx / Service Call'
+    #AP_INT_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy5.csv', index=False)
+    for MONTHID in [PREV_MONTHID, CURR_MONTHID]:
+        AP_INIT_DF = AP_INT_DF[AP_INT_DF['MONTH_ID'].isin([MONTHID])]
+        AP_TRT_DF = pd.merge(AP_INIT_DF, TRT_INIT_DF, on = 'TERRITORY', how='left').drop_duplicates()
+        AP_MCQ_DF = AP_TRT_DF[AP_TRT_DF['Affiliate'].isin(MCQ_AFF_List)]
+        AP_CHA_DF = AP_TRT_DF[AP_TRT_DF['Affiliate'].isin(MCQ_AFF_List) == False]
+        AP_CHA_DF = AP_CHA_DF.drop(['Affiliate'], axis=1)
+        AP_MCQ_DF = AP_MCQ_DF.drop(['Affiliate','CHANNEL'], axis=1)
+        #print("7")
+        #AP_INIT_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy4.csv', index=False)
+        AP_TEMP_DF = (pd.merge(AP_CHA_DF, MCQ_CHA_DF, on=['ACCOUNT_ID', 'TERRITORY', 'CHANNEL', \
+        'MONTH_ID'], how='left'))
+        #AP_TEMP_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy10.csv', index=False)
+        #print("8")
+        #AP_INIT_DF = AP_INIT_DF.drop(['CHANNEL'], axis=1)
+        AP_TEMP2_DF = (pd.merge(AP_MCQ_DF, MCQ_FIN_DF, on=['ACCOUNT_ID', 'TERRITORY', \
+        'MONTH_ID'], how='left'))
+        #AP_TEMP2_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy11.csv', index=False)
+        #print("9")
+        AP_FIN_DF = pd.concat([AP_TEMP2_DF,AP_TEMP_DF], ignore_index=True)
+        #print("10")
+        #AP_FIN_DF = (AP_FIN_DF.drop_duplicates(subset= ['TARGET_CALL','TA_ID','ACTIVITY_PLAN_ID','TARGETCLASS_ID','ACCOUNT_ID','PERIOD_ID','TERRITORY','OWNER_ID','NB_MONTHS','PERIOD_START_DT','Language_code', \
+        #'TimeZoneSidKey','AFFILIATE_ID','MONTH_ID','YEAR']))
+        #AP_FIN_DF.to_csv('s3://victoria-prd-s3-eu-reference/ioengage/aameo/ocp/dummy.csv', index=False)
+        AP_FIN_DF.ACTUAL_CALL = pd.to_numeric(AP_FIN_DF.ACTUAL_CALL, errors='coerce')
+        AP_FIN_DF.TARGET_CALL = pd.to_numeric(AP_FIN_DF.TARGET_CALL, errors='coerce')
+        AP_FIN_DF = AP_FIN_DF.drop(['PERIOD_START_DT'], axis=1)
+        AP_FIN_DF['ACTUAL_CALL'].fillna(0, inplace=True)
+        AP_FIN_DF['TARGET_CALL'].fillna(0, inplace=True)
+        AP_FIN_DF['REACH_IND'] = AP_FIN_DF.apply(lambda row: 0 if row.ACTUAL_CALL == 0 else 1, axis=1)
+        AP_FIN_DF['NUM_CAPED_CALLS'] = (AP_FIN_DF.apply(lambda x: x.TARGET_CALL \
+        if x.ACTUAL_CALL >= x.TARGET_CALL else x.ACTUAL_CALL, axis=1))
+        AP_FIN_DF['CALL_PLAN_COMPLIANCE_CUST'] = (AP_FIN_DF.apply(lambda y: 1 if (y.ACTUAL_CALL >= \
+        y.TARGET_CALL or y.TARGET_CALL == 0) else float(y.ACTUAL_CALL)/float(y.TARGET_CALL), axis=1))
+        AP_FIN_DF = (AP_FIN_DF[~(AP_FIN_DF['AFFILIATE_ID'].isin(['1-MLUFP'])\
+        &AP_FIN_DF['MONTH_ID'].isin(['022020']))])
+        #AP_FIN_DF = AP_FIN_DF[AP_FIN_DF['YEAR'].isin([YEAR])]
+        AP_FIN_DF = AP_FIN_DF.sort_values(by='MONTH_ID')
+        AP_FIN_DF = (pd.merge(AP_FIN_DF, LOC_LAN_DF, left_on=['CHANNEL', 'Language_code'], \
+        right_on=['Value', 'Language_code'], how='left'))
+        AP_FIN_DF['Translation'] = (AP_FIN_DF['Translation']\
+        .fillna(AP_FIN_DF['CHANNEL']))
+        if MONTHID[0:2] != '01':
+            PREV_M = (pd.to_numeric(datetime.strftime(pd.to_datetime(MONTHID, format='%m%Y'), '%m'), \
+            errors='coerce') - 1)
+            PREV_Y = MONTHID[-4:]
+            PREV_AP_M = date(int(PREV_YEAR),int(PREV_M),1).strftime('%m%Y')
+            PRE_AP_OBJ = (S3.get_object(Bucket=WH_BUCKET, \
+            Key='ioengage/data/aameo/{0}/csv/wh-activity-plan/wh-activity-plan-{1}.csv'\
+            .format(env, PREV_AP_M)))
+            PRE_AP_STR = PRE_AP_OBJ['Body'].read().decode('utf-8')
+            PRE_AP_DF = (pd.read_csv(io.StringIO(PRE_AP_STR), quotechar='"', sep=',', \
+            on_bad_lines='skip', dtype=str).drop_duplicates()\
+            .drop(['ACTUAL_CALL', 'TARGET_CALL'], axis=1))
+            PRE_AP_DF = (PRE_AP_DF.rename({'ACTUAL_CALL_YTD':'ACTUAL_CALL', \
+            'TARGET_CALL_YTD':'TARGET_CALL'}, axis=1))
+            AP_FIN = pd.concat([PRE_AP_DF,AP_FIN_DF], ignore_index=True).drop_duplicates()
+        else:
+            AP_FIN = AP_FIN_DF
+        AP_FIN = AP_FIN.sort_values(by='MONTH_ID')
+        AP_FIN.ACTUAL_CALL = pd.to_numeric(AP_FIN.ACTUAL_CALL, errors='coerce')
+        AP_FIN.TARGET_CALL = pd.to_numeric(AP_FIN.TARGET_CALL, errors='coerce')
+        AP_FIN['ACTUAL_CALL_YTD'] = (AP_FIN.groupby(by=['ACCOUNT_ID', 'CHANNEL', 'TERRITORY', \
+        'TARGETCLASS_ID', 'TA_ID'])['ACTUAL_CALL'].cumsum())
+        AP_FIN['TARGET_CALL_YTD'] = (AP_FIN.groupby(by=['ACCOUNT_ID', 'CHANNEL', 'TERRITORY', \
+        'TARGETCLASS_ID', 'TA_ID'])['TARGET_CALL'].cumsum())
+        AP_FIN['NUM_CAPED_CALLS_YTD'] = (AP_FIN.apply(lambda x: x.TARGET_CALL_YTD \
+        if x.ACTUAL_CALL_YTD >= x.TARGET_CALL_YTD else x.ACTUAL_CALL_YTD, axis=1))
+        AP_FIN['CALL_PLAN_COMPLIANCE_CUST_YTD'] = (AP_FIN.apply(lambda y: 1 \
+        if (y.ACTUAL_CALL_YTD >= y.TARGET_CALL_YTD or y.TARGET_CALL_YTD == 0) \
+        else float(y.ACTUAL_CALL_YTD)/float(y.TARGET_CALL_YTD), axis=1))
+        AP_FIN['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+        AP_FINAL_DF = (AP_FIN[AP_FIN['MONTH_ID'].isin([MONTHID])][['ACTIVITY_PLAN_ID', 'TA_ID', \
+        'ACTUAL_CALL', 'TARGET_CALL', 'TARGETCLASS_ID', 'ACCOUNT_ID', 'TERRITORY', 'OWNER_ID', \
+        'AFFILIATE_ID', 'MONTH_ID', 'YEAR', 'REACH_IND', 'NUM_CAPED_CALLS', \
+        'CALL_PLAN_COMPLIANCE_CUST', 'ACTUAL_CALL_YTD', 'TARGET_CALL_YTD', 'NUM_CAPED_CALLS_YTD', \
+        'CALL_PLAN_COMPLIANCE_CUST_YTD', 'CHANNEL', 'Translation', 'LAST_REFRESHED_DATE']])
+        uploadCSV('wh-activity-plan/wh-activity-plan-'+MONTHID+'.csv', AP_FINAL_DF)
+
+def wh_monthly_ap():
+    """Function to create WH_MONTHLY_AP TABLE"""
+    AP_DF = spark.read.option("header", True).option("delimiter",",").format("csv").load("s3://victoria-prd-s3-eu-warehouse/ioengage/data/aameo/{0}/csv/wh-activity-plan/*.csv".format(env))
+    print(AP_DF.count())
+    AP_DF = AP_DF.where(AP_DF.YEAR==YEAR)
+    print(AP_DF.count())
+    AP_DF = AP_DF.toPandas().fillna('')
+    print(AP_DF.shape)
+    AP_DF = AP_DF.sort_values(by='MONTH_ID')
+    AP_DF.ACTUAL_CALL = pd.to_numeric(AP_DF.ACTUAL_CALL, errors='coerce')
+    AP_DF.TARGET_CALL = pd.to_numeric(AP_DF.TARGET_CALL, errors='coerce')
+    AP_DF.REACH_IND = pd.to_numeric(AP_DF.REACH_IND, errors='coerce')
+    AP_DF['RUNNING_ACTUAL'] = (AP_DF.groupby(by=['ACTIVITY_PLAN_ID'])['ACTUAL_CALL'].cumsum())
+    AP_DF['RUNNING_TARGET'] = (AP_DF.groupby(by=['ACTIVITY_PLAN_ID'])['TARGET_CALL'].cumsum())
+    AP_DF['RUNNING_REACH_IND'] = (AP_DF.groupby(by=['ACTIVITY_PLAN_ID'])['REACH_IND'].cumsum())
+    AP_DF['RUNNING_REACH_IND'] = (AP_DF.apply(lambda x: 1 \
+    if x.RUNNING_REACH_IND >= 1 else x.RUNNING_REACH_IND, axis=1))
+    AP_DF['OVERALL_ACTUAL'] = (AP_DF.groupby(by=['ACTIVITY_PLAN_ID'])['RUNNING_ACTUAL'].transform('max'))
+    AP_DF['OVERALL_ACTUAL'] = round(AP_DF['OVERALL_ACTUAL'])
+    AP_DF['OVERALL_TARGET'] = (AP_DF.groupby(by=['ACTIVITY_PLAN_ID'])['RUNNING_TARGET'].transform('max'))
+    AP_DF['OVERALL_TARGET'] = round(AP_DF['OVERALL_TARGET'])
+    AP_DF['RUNNING_CAPED_CALLS'] = (AP_DF.apply(lambda x: x.RUNNING_TARGET \
+    if x.RUNNING_ACTUAL >= x.RUNNING_TARGET else x.RUNNING_ACTUAL, axis=1))
+    AP_DF['OVERALL_CAPED_CALLS'] = (AP_DF.apply(lambda x: x.OVERALL_TARGET \
+    if x.OVERALL_ACTUAL >= x.OVERALL_TARGET else x.OVERALL_ACTUAL, axis=1))
+    AP_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    AP_FIN_DF = (AP_DF[['ACTIVITY_PLAN_ID', 'CHANNEL', 'Translation', 'TA_ID', 'ACTUAL_CALL', \
+    'TARGET_CALL', 'TARGETCLASS_ID', 'ACCOUNT_ID', 'TERRITORY', 'OWNER_ID', 'AFFILIATE_ID', \
+    'MONTH_ID', 'YEAR', 'REACH_IND', 'NUM_CAPED_CALLS', 'CALL_PLAN_COMPLIANCE_CUST', \
+    'ACTUAL_CALL_YTD', 'TARGET_CALL_YTD', 'NUM_CAPED_CALLS_YTD', 'CALL_PLAN_COMPLIANCE_CUST_YTD', \
+    'RUNNING_ACTUAL', 'RUNNING_TARGET', 'OVERALL_ACTUAL', 'OVERALL_TARGET', \
+    'RUNNING_CAPED_CALLS', 'OVERALL_CAPED_CALLS', 'LAST_REFRESHED_DATE','RUNNING_REACH_IND']])
+    uploadCSV('wh-monthly-ap/wh-monthly-ap-'+YEAR+'.csv', AP_FIN_DF)
+    
+def wh_call_adr():
+    CALL_DF = (spark.read.option("header", True).option("delimiter","\t").format("csv").load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__CALL__C/*.csv".format(env)) \
+    .select(['Id', 'OCE__CallAddress__c','OCE__AddressLine1__c','OCE__CallDateTime__c','OCE__Location__c']))
+    CALL_DF = CALL_DF.where(col("OCE__CallDateTime__c") > lit("2023-01-01"))
+    ACCNTADDR_DF = spark.read.option("header", True).option("delimiter","\t").format("csv").load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__ACCOUNTADDRESS__C/*.csv".format(env)).select(['Id', 'OCE__ADDRESS__C'])
+    ADDR_DF = spark.read.option("header", True).option("delimiter","\t").format("csv").load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__ADDRESS__C/*.csv".format(env)).select(['Id', 'NNAE_Address_State__c'])
+    ACCNTADDR_DF = ACCNTADDR_DF.withColumnRenamed("Id","OCE__ACCOUNTADDRESS__C")
+    ADDR_DF = ADDR_DF.withColumnRenamed("Id","OCE__ADDRESS__C")
+    CALL_ACDR_DF = CALL_DF.join(ACCNTADDR_DF, CALL_DF['OCE__Location__c'] == ACCNTADDR_DF['OCE__ACCOUNTADDRESS__C'], how='left')
+    CALL_FIN = CALL_ACDR_DF.join(ADDR_DF, CALL_ACDR_DF['OCE__ADDRESS__C'] == ADDR_DF['OCE__ADDRESS__C'], how='left')
+    CALL_FIN = CALL_FIN.toPandas()
+    CALL_FIN['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    CALL_FIN = CALL_FIN[['Id', 'OCE__CallAddress__c','OCE__AddressLine1__c','NNAE_Address_State__c','LAST_REFRESHED_DATE']].drop_duplicates()
+    uploadCSV('wh-call-adr/wh-call-adr.csv', CALL_FIN)
+    
+def wh_central_table():
+    PER_DF = csv_dataframe(PERPATH, 'utf-8', ['Id', 'OCE__StartDate__c'])
+    AP_DF = csv_dataframe(APPATH, 'utf-8', ['OCE__AccountGoal__c',  'NNAE_Target_Class__c', 'NNAE_Therapy_Area_Product__c', 'Id','NNAE_Sub_target_Class__c'])
+    AG_DF = csv_dataframe(AGPATH, 'utf-8', ['OCE__Account__c', 'OCE__PlanCycle__c', 'Id'])
+    PC_DF = csv_dataframe(PCPATH, 'utf-8', ['Id', 'OCE__Period__c', 'OCE__Territory__c'])
+    
+    PER_DF.columns = ['PERIOD_ID','PERIOD_START_DT']
+    AP_DF.columns = (['ACCOUNT_GOAL_ID','TARGET_CLASS', 'TA_ID', 'ACTIVITY_PLAN_ID','SUB_TARGET_CLASS'])
+    AG_DF.columns = ['ACCOUNT_ID', 'PLAN_CYCLE_ID', 'ACCOUNT_GOAL_ID']
+    PC_DF.columns = ['PLAN_CYCLE_ID', 'PERIOD_ID', 'TERRITORY']
+    AP_DF1 = (AP_DF[['ACCOUNT_GOAL_ID', 'TA_ID', 'TARGET_CLASS', 'SUB_TARGET_CLASS']]\
+    .drop_duplicates().fillna(''))
+
+    AP_TC_DF = (pd.merge(AP_DF1, TC_DF.drop_duplicates(), left_on=['SUB_TARGET_CLASS', 'TARGET_CLASS'], \
+    right_on=['SUB_TARGET_CLASS', 'TARGET_CLASS'])\
+    .drop(['SUB_TARGET_CLASS', 'TARGET_CLASS'], axis=1))
+    print("mid ap data")
+    PC_PER_DF = (pd.merge(PC_DF, PER_DF, left_on='PERIOD_ID', right_on='PERIOD_ID')\
+    .drop(['PERIOD_ID'], axis=1))
+    PC_PER_DF['MONTH_ID'] = (pd.to_datetime(PC_PER_DF['PERIOD_START_DT'])\
+    .apply(lambda x: x.strftime('%m%Y')))
+    AG_PC_PER_DF = (pd.merge(AG_DF, PC_PER_DF, left_on='PLAN_CYCLE_ID', right_on='PLAN_CYCLE_ID')\
+    .drop(['PLAN_CYCLE_ID'], axis=1))
+    AP_AGG_DF = (pd.merge(AP_TC_DF, AG_PC_PER_DF, left_on='ACCOUNT_GOAL_ID', \
+    right_on='ACCOUNT_GOAL_ID').drop(['ACCOUNT_GOAL_ID','PERIOD_START_DT'], axis=1))
+    print("read ap files")
+    print(AP_AGG_DF.columns)
+    #s3://victoria-prd-s3-eu-warehouse/ioengage/data/aameo/prod/csv/wh-atp-data/wh-atp-data-072023.csv
+    for MONTHID in [CURR_MONTHID]:
+        AP_AGG_DF = AP_AGG_DF[AP_AGG_DF['MONTH_ID'].isin([MONTHID])]
+        PRE_AL_OBJ = (S3.get_object(Bucket=WH_BUCKET, \
+        Key='ioengage/data/aameo/{0}/csv/wh-atp-data/wh-atp-data-{1}.csv'\
+        .format(env, MONTHID)))
+        PRE_AL_STR = PRE_AL_OBJ['Body'].read().decode('utf-8')
+        PRE_AL_DF = (pd.read_csv(io.StringIO(PRE_AL_STR), quotechar='"', sep=',', \
+        on_bad_lines='skip', dtype=str, usecols=['OCE__Account__c', 'OCE__Product__c', 'NNAE_Territory__c', 'TARGETCLASS_ID', 'MONTH_ID']).drop_duplicates())
+        print(PRE_AL_DF.columns)
+        desired_columns = ['OCE__Product__c', 'TARGETCLASS_ID', 'OCE__Account__c', 'NNAE_Territory__c', 'MONTH_ID']
+        PRE_AL_DF = PRE_AL_DF[desired_columns]
+
+        PRE_AL_DF.columns = (['TA_ID', 'TARGETCLASS_ID','ACCOUNT_ID','TERRITORY', 'MONTH_ID'])
+        PRE_AL_DF = PRE_AL_DF[PRE_AL_DF['TERRITORY'] != '']
+        print("read adoption ladder data")
+        
+        PRE_AL_DF['TARGETCLASS_ID'] = PRE_AL_DF['TARGETCLASS_ID'].fillna('X')
+
+        TEMP_CHECK = ['TA_ID','ACCOUNT_ID','TERRITORY', 'MONTH_ID']
+        #check missing
+        DF_MIS_TEMP = PRE_AL_DF[~PRE_AL_DF[TEMP_CHECK].set_index(TEMP_CHECK).index.isin(AP_AGG_DF[TEMP_CHECK].set_index(TEMP_CHECK).index)]
+        print(DF_MIS_TEMP.columns)
+        print("get missing details from adl")
+        DF_MIS_TEMP.sort_values(by=['TARGETCLASS_ID'], ascending=True, inplace=True)
+
+        deduplicated_df = DF_MIS_TEMP.drop_duplicates(subset=[ 'TA_ID','ACCOUNT_ID', 'TERRITORY', 'MONTH_ID'], keep='first')
+        print(deduplicated_df.columns)
+        FIN_ATP_AP = pd.concat([AP_AGG_DF,deduplicated_df], ignore_index=True).drop_duplicates()
+        print(FIN_ATP_AP.columns)
+        CALL_DF = spark.read.option("header", True).option("delimiter",",").option("quote","\"").format("csv").load("s3://victoria-prd-s3-eu-warehouse/ioengage/data/aameo/{0}/csv/wh-call/wh-call.csv".format(env))
+        CALL_DF = CALL_DF.toPandas()      
+        CALL_DF = CALL_DF[['THERAPYAREA_ID','TARGETCLASS_ID','OCE__Account__c','OCE__Territory__c','MONTH_ID']]   
+        print(CALL_DF.columns) 
+        CALL_DF.columns = (['TA_ID', 'TARGETCLASS_ID','ACCOUNT_ID','TERRITORY', 'MONTH_ID'])
+        CALL_DF = CALL_DF[CALL_DF['MONTH_ID'].isin([MONTHID])]
+        print("after first merge")
+        DF_MIS_TEMP2 = CALL_DF[~CALL_DF[TEMP_CHECK].set_index(TEMP_CHECK).index.isin(FIN_ATP_AP[TEMP_CHECK].set_index(TEMP_CHECK).index)]
+        print(DF_MIS_TEMP2.columns) 
+
+        DF_MIS_TEMP2.sort_values(by=['TARGETCLASS_ID'], ascending=True, inplace=True)
+        deduplicated_df2 = DF_MIS_TEMP2.drop_duplicates(subset=[ 'TA_ID','ACCOUNT_ID', 'TERRITORY', 'MONTH_ID'], keep='first') 
+        print(deduplicated_df2.columns) 
+
+        FIN_DF = pd.concat([FIN_ATP_AP,deduplicated_df2], ignore_index=True).drop_duplicates()
+
+        FIN_DF = FIN_DF[FIN_DF['TERRITORY'] != '']
+        uploadCSV('wh-central-table/wh-central-table-'+CURR_MONTHID+'.csv', FIN_DF)
+
+FUNCTIONS = (wc_call_acc_a,wh_monthly_ap,wh_call_adr)
+#FUNCTIONS = [wc_call_acc_a,wh_monthly_ap]
+
+for func in FUNCTIONS:
+    try:
+        print('Processing the function '+str(func))
+        func()
+    except Exception as e:
+        print(e)
+        continue
