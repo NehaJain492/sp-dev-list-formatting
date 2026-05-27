@@ -1,0 +1,194 @@
+#!/usr/local/bin/python3
+"""Script to convert OCE_EXPORT TABLES INTO WAREHOUSE TABLES for BI reporting"""
+import csv
+import io
+import logging
+from datetime import datetime, timedelta, date
+import pandas as pd
+import numpy as np
+import calendar
+import boto3
+import json
+
+import pyspark.sql.functions as f
+from pyspark.sql.functions import col, lit
+from pyspark.sql import SQLContext
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+CSV_BUFFER = io.StringIO()
+sc = SparkContext()
+glueContext = GlueContext(sc)
+logger = glueContext.get_logger()
+spark = glueContext.spark_session
+sqlcontext = SQLContext(sc)
+
+S3 = boto3.client('s3')
+S3RESOURCE = boto3.resource('s3')
+env = 'prod'
+YEAR = datetime.strftime(datetime.now(), '%Y')
+MONTHID = datetime.strftime(datetime.now(), '%m%Y')
+LAST_REFRESHED_DT = datetime.strftime(CURR_DT, '%Y-%m-%d %H:%M:%S')
+CURR_DT = datetime.now()
+CURR_YEAR = datetime.strftime(CURR_DT-timedelta(days=1), '%Y')
+MONTH = datetime.strftime(CURR_DT-timedelta(days=1), '%m')
+CURR_LASTDATE = datetime.strftime(CURR_DT, '%Y-%m-%d')
+CURR_FIRSTDATE = date(int(CURR_YEAR),int(MONTH),1).strftime('%Y-%m-%d')
+
+CLM_CHANNEL_LIST = ['Remote Detailing', 'Remote', 'Face To Face', 'MS Teams']
+
+SRCBUCKET = 'victoria-prd-eu-lambda'
+WH_BUCKET = 'victoria-prd-s3-eu-warehouse'
+USRPATH = 'ioengage/data/aameo/{0}/csv/USER/'.format(env)
+CD_PATH = 'ioengage/data/aameo/{0}/csv/OCE__CALLDETAIL__C/'.format(env)
+CM_PATH = 'ioengage/data/aameo/{0}/csv/OCE__CALLMESSAGE__C/'.format(env)
+PM_PATH = 'ioengage/data/aameo/{0}/csv/OCE__PRODUCTMESSAGE__C/'.format(env)
+CSM_PATH = 'ioengage/data/aameo/{0}/csv/OCE__CLICKSTREAMMETRIC__C/'.format(env)
+SEQ_PATH = 'ioengage/data/aameo/{0}/csv/OCE__SEQUENCE__C/'.format(env)
+
+CD_COLS = ['Id', 'OCE__Call__c', 'OCE__Product__c', 'OCE__DisplayOrder__c']
+CM_COLS = (['OCE__Call__c', 'OCE__ProductMessage__c', 'OCE__Reaction__c', 'OCE__Product__c', \
+'CreatedDate', 'Id'])
+PM_COLS = ['Id', 'OCE__ProductMessageText__c']
+CSM_COLS = (['OCE__Call__c', 'OCE__Slide__c', 'OCE__UsageStartTime__c', 'OCE__UsageEndTime__c', \
+'OCE__UsageDuration__c', 'OCE__Sequence__c', 'OCE__PresentationName__c', \
+'OwnerId', 'OCE__Presentation__c', 'OCE__Reaction__c', 'OCE__CallMessage__c', \
+'OCE__CallDetail__c', 'OCE__GuestAccountName__c', 'OCE__AttendeeBrowser__c', \
+'OCE__AttendeeDeviceOS__c', 'OCE__AttendeeDeviceType__c', 'OCE__Meeting__c','OCE__MetricType__c'])
+SEQ_COLS = ['Id', 'NNAE_SequenceCategory__c', 'NNAE_SequenceSubCategory__c', 'Name']
+
+def csv_dataframe(prefix, encoding, columns):
+    s3resource = boto3.resource('s3')
+    bucket = s3resource.Bucket(SRCBUCKET)
+    prefix_objs = bucket.objects.filter(Prefix=prefix)
+    prefix_df = []
+    filter_cols = ['Id', 'LastModifiedDate']
+    for obj in prefix_objs:
+        if '.csv' in obj.key:
+            body = obj.get()['Body'].read().decode(encoding)
+            df = (pd.read_csv(io.StringIO(body), quotechar='"', sep='\t', dtype='str', \
+            error_bad_lines=False, usecols=columns+filter_cols))
+            prefix_df.append(df)
+    DF = pd.concat(prefix_df).sort_values(by='LastModifiedDate')
+    DF = DF.drop_duplicates(['Id'], keep='last')[columns]
+    return DF
+
+def uploadCSV(OBJ_PATH, FINAL_DF):
+#Make sure that boto3 module is imported an'OCE__IsPrimary__c'd s3 resource is referred
+    DESTBUCKET = WH_BUCKET
+    DESTMASTERPATH = 'ioengage/data/aameo/{0}/csv/'.format(env)
+    csv_buffer = io.StringIO()
+    (FINAL_DF.to_csv(csv_buffer, sep=',', quotechar='"', encoding='utf-8', quoting=csv.QUOTE_ALL, \
+    index=False))
+    S3RESOURCE.Object(DESTBUCKET, DESTMASTERPATH+OBJ_PATH).put(Body=csv_buffer.getvalue())
+    print("loaded "+OBJ_PATH)
+
+def wh_clm_data():
+    CALL_COLS = (['OCE__CallDateTime__c', 'Id', 'OCE__Territory__c', 'OCE__Account__c', \
+    'OCE__Status__c', 'THERAPYAREA_ID', 'TARGETCLASS_ID', 'MONTH_ID', 'OCE__ParentCall__c'])
+    CALL_FULL_DF = spark.read.option("header", True).option("delimiter",",").option("quote", "\"").format("csv").load("s3://victoria-prd-s3-eu-warehouse/ioengage/data/aameo/{0}/csv/wh-call/*.csv".format(env)).select(CALL_COLS)
+    print(CALL_FULL_DF.count())
+    CALL_FULL_DF = CALL_FULL_DF.filter(~col("Id").isin(["a1m68000005W52nAAC"]))
+    print(CALL_FULL_DF.count())
+    CSM_DF = spark.read.option("header", True).option("delimiter","\t").format("csv").load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__CLICKSTREAMMETRIC__C/*.csv".format(env)).select(CSM_COLS)
+    #CSM_DF = CSM_DF.where((col("OCE__UsageStartTime__c") > lit("2023-06-30"))&(col("OCE__UsageStartTime__c") < lit("2023-07-15")))
+    #CSM_DF = CSM_DF.where((col("OCE__UsageStartTime__c") > lit("2022-01-15"))&(col("OCE__UsageStartTime__c") < lit("2022-01-25")))
+    CSM_DF = CSM_DF.where(col("OCE__UsageStartTime__c") > lit("2023-07-15"))
+    CSM_FIL_DF = CSM_DF.select(['OCE__CallMessage__c'])
+    CSM_FIL_DF = CSM_FIL_DF.withColumnRenamed("OCE__CallMessage__c","CallMSg_Id")
+    CSM_PAR_DF = CSM_DF.join(CALL_FULL_DF,(CSM_DF.OCE__Call__c == CALL_FULL_DF.Id)).dropDuplicates()
+    CSM_CHILD_DF = CSM_DF.join(CALL_FULL_DF,(CSM_DF.OCE__Call__c == CALL_FULL_DF.OCE__ParentCall__c)).dropDuplicates()
+    CSM_PAR_DF = CSM_PAR_DF.toPandas()
+    CSM_CHILD_DF = CSM_CHILD_DF.toPandas()
+    CSM_CHILD_DF = CSM_CHILD_DF.drop('OCE__Call__c', axis=1).rename({'Id':'OCE__Call__c'}, axis=1)
+    print(CSM_PAR_DF.shape)
+    print(CSM_CHILD_DF.shape)
+    USER_DF = csv_dataframe(USRPATH, 'utf-8', ['Id', 'TimeZoneSidKey'])
+    USER_DF.columns = ['OwnerId', 'TIME_ZONE']
+    CSM_FULL_DF = pd.concat([CSM_PAR_DF,CSM_CHILD_DF], ignore_index=True).drop_duplicates()
+    print(list(CSM_FULL_DF['MONTH_ID'].drop_duplicates()))
+    print(list(CSM_FULL_DF[CSM_FULL_DF['MONTH_ID'].isin(['0.0'])]['OCE__Call__c'].drop_duplicates().head()))
+    print(CSM_FULL_DF.shape)
+    CALL_LIST = list(CSM_FULL_DF['OCE__Call__c'].drop_duplicates())
+    CSM_CALL_FIL_DF = CSM_FULL_DF[['OCE__Call__c']].drop_duplicates()
+    CSM_CALL_FIL_DF = CSM_CALL_FIL_DF.rename({'OCE__Call__c':'call'}, axis=1)
+    CSM_CALL_FIL_DF = spark.createDataFrame(CSM_CALL_FIL_DF)
+    CSM_FULL_DF[['OCE__UsageStartTime__c', 'OCE__UsageEndTime__c']] = (CSM_FULL_DF[['OCE__UsageStartTime__c', \
+    'OCE__UsageEndTime__c']].apply(pd.to_datetime))
+    CSM_FULL_DF['YEAR'] = CSM_FULL_DF['OCE__UsageStartTime__c'].apply(lambda x: x.strftime('%Y'))
+    #CSM_FULL_DF = CSM_FULL_DF[~CSM_FULL_DF['YEAR'].isin(['2019', '2020'])]
+    CD_DF = spark.read.option("header", True).option("delimiter","\t").format("csv").load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__CALLDETAIL__C/*.csv".format(env)).select(CD_COLS)
+    CD_DF = CD_DF.join(CSM_CALL_FIL_DF,(CD_DF.OCE__Call__c == CSM_CALL_FIL_DF.call)).dropDuplicates()
+    CD_DF = CD_DF.toPandas()
+    print(CD_DF.shape)
+    CD_DF = CD_DF[CD_DF['OCE__Call__c'].isin(CALL_LIST)]
+    CD_DF = CD_DF.rename({'Id':'OCE__CallDetail__c'}, axis=1)
+    print(CD_DF.shape)
+    CM_DF = spark.read.option("header", True).option("delimiter","\t").format("csv").load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__CALLMESSAGE__C/*.csv".format(env)).select(CM_COLS)
+    print(CM_DF.count())
+    CM_DF = CM_DF.join(CSM_FIL_DF,(CM_DF.Id == CSM_FIL_DF.CallMSg_Id)).dropDuplicates()
+    #CM_DF = CM_DF.where((col("CreatedDate") > lit("2021-05-31"))&(col("CreatedDate") < lit("2021-10-31")))
+    #CM_DF = CM_DF.where(col("CreatedDate") < lit("2021-03-31"))
+    print(CM_DF.count())
+    CM_DF = CM_DF.toPandas()
+    CM_DF = CM_DF.rename({'Id':'OCE__CallMessage__c'}, axis=1)
+    CM_DF = CM_DF.drop('CallMSg_Id', axis=1)
+    print(CM_DF.shape)
+    PM_DF = csv_dataframe(PM_PATH, 'utf-8', PM_COLS).drop_duplicates()
+    PM_DF = PM_DF.rename({'Id':'OCE__ProductMessage__c'}, axis=1)
+    print(PM_DF.shape)
+    SEQ_DF = csv_dataframe(SEQ_PATH, 'utf-8', SEQ_COLS)
+    SEQ_DF = SEQ_DF.rename({'Id':'OCE__Sequence__c', 'Name':'OCE__SequenceName__c'}, axis=1)
+    CM_PM_DF = (pd.merge(CM_DF[['OCE__CallMessage__c', 'OCE__ProductMessage__c']], PM_DF, \
+    on='OCE__ProductMessage__c', how='left').drop(['OCE__ProductMessage__c'], axis=1))
+    CLM_DF = (pd.merge(CSM_FULL_DF.drop(['Id'], axis=1), USER_DF, left_on='OwnerId', \
+    right_on='OwnerId'))
+    print(CLM_DF.shape)
+    print(list(CLM_DF['MONTH_ID'].drop_duplicates()))
+    CLM_DF['OCE__UsageStartTime__c'] =  (CLM_DF.groupby('TIME_ZONE')['OCE__UsageStartTime__c']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    CLM_DF['OCE__UsageEndTime__c'] =  (CLM_DF.groupby('TIME_ZONE')['OCE__UsageEndTime__c']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    CLM_FIN_DF = (pd.merge(pd.merge(pd.merge(CLM_DF, CM_PM_DF, on='OCE__CallMessage__c', \
+    how='left'), CD_DF[['OCE__Product__c', 'OCE__CallDetail__c']], on='OCE__CallDetail__c', \
+    how='left'), SEQ_DF, on='OCE__Sequence__c', how='left'))
+    print(list(CLM_FIN_DF['MONTH_ID'].drop_duplicates()))
+    print(CLM_FIN_DF.shape)
+    #Single Product Call_df
+    CALL_PRD_DF = CD_DF[['OCE__Call__c', 'OCE__Product__c']].dropna().drop_duplicates()
+    CALL_PRD_DF['COUNT'] = 1
+    CALL_PRD_GRP = CALL_PRD_DF.groupby(['OCE__Call__c'], as_index=False).agg({'COUNT':sum})
+    SINGLE_PRD_CALLS = (list(CALL_PRD_GRP[CALL_PRD_GRP['COUNT'].isin([1])]['OCE__Call__c']\
+    .drop_duplicates()))
+    SINGLE_PRD_CALL_DF = (CD_DF[CD_DF['OCE__Call__c'].isin(SINGLE_PRD_CALLS)]\
+    [['OCE__Call__c', 'OCE__Product__c']].drop_duplicates())
+    SINGLE_PRD_CALL_DF = SINGLE_PRD_CALL_DF.rename({'OCE__Product__c':'CALL_PRODUCT'}, axis=1)
+    CLM_FIN_DF = pd.merge(CLM_FIN_DF, SINGLE_PRD_CALL_DF, on='OCE__Call__c', how='left')
+    CLM_FIN_DF.loc[CLM_FIN_DF['OCE__CallDetail__c'].isna(), 'OCE__Product__c'] = CLM_FIN_DF['CALL_PRODUCT']
+    CLM_FIN_DF.loc[CLM_FIN_DF['MONTH_ID'].isin(['12.0']), 'MONTH_ID'] = '092021'
+    CLM_FIN_DF.loc[CLM_FIN_DF['MONTH_ID'].isin(['0.0']), 'MONTH_ID'] = '122021'
+    CLM_FIN_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    CLM_FIN_DF = (CLM_FIN_DF[['OCE__CallDateTime__c', 'OwnerId', 'OCE__Call__c', \
+    'OCE__Status__c', 'OCE__Account__c', 'OCE__Product__c', 'OCE__ProductMessageText__c', \
+    'OCE__Presentation__c', 'OCE__PresentationName__c', 'OCE__Sequence__c', \
+    'OCE__SequenceName__c', 'OCE__Slide__c', 'OCE__UsageStartTime__c', 'OCE__UsageEndTime__c', \
+    'OCE__UsageDuration__c', 'OCE__Reaction__c', 'THERAPYAREA_ID', \
+    'TARGETCLASS_ID', 'MONTH_ID', 'OCE__Territory__c', 'OCE__GuestAccountName__c', \
+    'OCE__AttendeeBrowser__c', 'OCE__AttendeeDeviceOS__c', 'OCE__AttendeeDeviceType__c', \
+    'OCE__Meeting__c', 'NNAE_SequenceCategory__c', 'NNAE_SequenceSubCategory__c','OCE__MetricType__c','LAST_REFRESHED_DATE']].drop_duplicates())
+    print(CLM_FIN_DF.shape)
+    print(list(CLM_FIN_DF['MONTH_ID'].drop_duplicates()))
+    uploadCSV('wh-clm-data/wh-clm-data.csv', CLM_FIN_DF)
+
+FUNCTIONS = [wh_clm_data]
+
+for func in FUNCTIONS:
+    try:
+        print('Processing the function '+str(func))
+        func()
+    except Exception as e:
+        print(e)
+        continue
