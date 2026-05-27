@@ -1,0 +1,1046 @@
+
+#!/usr/local/bin/python3
+"""Script to convert OCE_EXPORT TABLES INTO WAREHOUSE TABLES for BI reporting"""
+import csv
+import io
+import logging
+from datetime import datetime, timedelta, date
+import pandas as pd
+import numpy as np
+import boto3
+import re
+
+import pyspark.sql.functions as f
+from pyspark.sql.functions import col, lit
+from pyspark.sql import SQLContext
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+CSV_BUFFER = io.StringIO()
+sc = SparkContext()
+glueContext = GlueContext(sc)
+logger = glueContext.get_logger()
+spark = glueContext.spark_session
+sqlcontext = SQLContext(sc)
+
+S3 = boto3.client('s3')
+S3RESOURCE = boto3.resource('s3')
+env = 'prod'
+YEAR = datetime.strftime(datetime.now(), '%Y')
+#june_2025 = datetime(2025, 6, 1)
+MONTHID = datetime.strftime(datetime.now(), '%m%Y')
+
+CURR_DT = datetime.now()
+#CURR_DT = datetime(2023, 2, 28, 18, 30, 29, 431717)
+LAST_REFRESHED_DT = datetime.strftime(CURR_DT, '%Y-%m-%d %H:%M:%S')
+#YEAR = datetime.strftime(CURR_DT, '%Y')
+CURR_YEAR = datetime.strftime(CURR_DT, '%Y')
+MONTH = datetime.strftime(CURR_DT, '%m')
+CURR_MONTHID = datetime.strftime(CURR_DT, '%m%Y')
+
+if MONTH == '01':
+    PREV_MONTH = 12
+    PREV_YEAR = pd.to_numeric(datetime.strftime(CURR_DT, '%Y'), errors='coerce') - 1
+else:
+    PREV_MONTH = pd.to_numeric(datetime.strftime(CURR_DT, '%m'), errors='coerce') - 1
+    PREV_YEAR = CURR_YEAR
+
+PRE_PREV_DT = (date(int(PREV_YEAR),int(PREV_MONTH),1) - timedelta(days=1)).strftime('%Y-%m-%d')
+
+PREV_MONTHID = str(PREV_MONTH)+str(PREV_YEAR)
+PREV_MONTHID = pd.to_datetime(PREV_MONTHID, format='%m%Y').strftime('%m%Y')
+
+SRCBUCKET = 'victoria-prd-eu-lambda'
+WH_BUCKET = 'victoria-prd-s3-eu-warehouse'
+ACCNTPATH = 'ioengage/data/aameo/{0}/csv/ACCOUNT/'.format(env)
+ACCNTADDRPATH = 'ioengage/data/aameo/{0}/csv/OCE__ACCOUNTADDRESS__C/'.format(env)
+ADDRPATH = 'ioengage/data/aameo/{0}/csv/OCE__ADDRESS__C/'.format(env)
+PRDPATH = 'ioengage/data/aameo/{0}/csv/OCE__PRODUCT__C/'.format(env)
+RECTYPEPATH = 'ioengage/data/aameo/{0}/csv/RECORDTYPE/'.format(env)
+TRTPATH = 'ioengage/data/aameo/{0}/csv/TERRITORY2/'.format(env)
+USERTRTPATH = 'ioengage/data/aameo/{0}/csv/USERTERRITORY2ASSOCIATION/'.format(env)
+ACCTTRTPATH = 'ioengage/data/aameo/{0}/csv/OCE__ACCOUNTTERRITORYFIELDS__C/'.format(env)
+USRPATH = 'ioengage/data/aameo/{0}/csv/USER/'.format(env)
+PROFPATH = 'ioengage/data/aameo/{0}/csv/PROFILE/'.format(env)
+FCPATH = 'ioengage/data/aameo/{0}/csv/OCE__FIELDCOACHINGEVENT__C/'.format(env)
+FC_DATA_PATH = 'ioengage/data/aameo/{0}/csv/OCE__FIELDCOACHINGEVENTDATA__C/'.format(env)
+ATPPATH = 'ioengage/data/aameo/{0}/csv/OCE__ACCOUNTTERRITORYPRODUCT__C/'.format(env)
+PERPATH = 'ioengage/data/aameo/{0}/csv/OCE__PERIOD__C/'.format(env)
+PCPATH = 'ioengage/data/aameo/{0}/csv/OCE__PLANCYCLE__C/'.format(env)
+APPATH = 'ioengage/data/aameo/{0}/csv/OCE__ACTIVITYPLAN__C/'.format(env)
+AGPATH = 'ioengage/data/aameo/{0}/csv/OCE__ACCOUNTGOAL__C/'.format(env)
+OCPPATH = 'ioengage/aameo/ocp/OCP-DATA-{}.xlsx'.format(YEAR)
+AFFPATH = 'ioengage/data/aameo/{0}/csv/wh-affiliate/affiliate.csv'.format(env)
+TC_PATH = 'ioengage/data/aameo/{0}/csv/wh-target-class/wh-target-class.csv'.format(env)
+TPAPATH = 'ioengage/data/aameo/{0}/csv/OCE__TERRITORYPRODUCTALIGNMENTRULE__C/'.format(env)
+SV_PATH = 'ioengage/data/aameo/{0}/csv/SURVEY/'.format(env)
+DIV_PATH = 'ioengage/data/aameo/{0}/csv/DIVISION/'.format(env)
+EMAIL_TR_PATH = 'ioengage/data/aameo/{0}/csv/OCE__EMAILTRANSACTION__C/'.format(env)
+EMAIL_TEMP_PATH = 'ioengage/data/aameo/{0}/csv/OCE__EMAILTEMPLATE__C/'.format(env)
+NN_GLB_PRD_PATH = 'ioengage/data/aameo/{0}/csv/NNAE_GLOBALPRODUCT__C/'.format(env)
+FCFQ_DATA_PATH = 'ioengage/data/aameo/{0}/csv/OCE__FIELDCOACHINGFORMQUESTION__C/'.format(env)
+FCQ_DATA_PATH = 'ioengage/data/aameo/{0}/csv/OCE__FIELDCOACHINGQUESTION__C/'.format(env)
+
+ACCNT_COLS = (['Id', 'OwnerId', 'OCE__Type__c', 'OCE__UniqueIntegrationID__c', 'Name', \
+'FirstName', 'LastName', 'PersonTitle', 'OCE__Specialty__c', 'OCE__Status__c', \
+'OCE__WorkPhone__c', 'PersonEmail', 'NNEU_Core_TotalOfPatientsAll__c', \
+'NNEU_Core_InfluenceLevelTier__c', 'NNEU_Core_BehaviouralSegment__c', 'OCE__IsKOL__c', \
+'OCE__ParentAccount__c', 'NNAE_National_ID__c', 'NNEU_Core_OKC_LicenseNumber__c', \
+'OCE__Specialty2__c', 'OCE__Specialty3__c', 'IsPersonAccount', 'OCE__IMSID__c', \
+'NNAE_Non_One_Key_ID_Admin_Created__c', 'NNAE_PL_Non_One_Key_ID__c', 'NNAE_Language__c', \
+'NNAE_Scientific_Influencer__c', 'NNEU_Core_InvestorExperience__c', 'NNEU_Core_RisingStar__c', \
+'OCE__IsActive__c', 'RecordTypeId', 'OCE__RecordTypeName__c', \
+'NNEU_Core_PopulationResponsibleFor__c', 'NNEU_Core_DrugBudgetResponsibilityAmount__c', \
+'NNAE_Access_Influencer__c', 'NNEU_Core_FormularyInfluenceReference__c', \
+'NNEU_Core_FormularySubmitter__c', 'NNEU_Core_InitiatorbyTherapies__c', \
+'NNAE_Guidelines_Pathways__c', 'NNAE_Access_Speaker__c', 'NNEU_Core_IndustryAccess__c', \
+'NNEU_Core_ServiceDevelopment__c', 'NNEU_Core_HCPFormularyAdherence__c', \
+'NNEU_Core_GuidelinePathwayAdherence__c', 'NNEU_Core_PolicyDrivenHealthSystem__c', 'Salutation', \
+'OCE__Gender__c', 'OCE__UltimateParentAccount__c', 'NNAE_Webinars__c', \
+'NNAE_Initiator_by_Class__c', 'NNAE_Behavioural_segment__c', 'NNAE_Target_by_Role__c', \
+'NNAE_PreApprovedEmail__c', 'NNAE_PhoneEngagement__c', 'NNAE_RemoteEngagement__c', \
+'NNAE_Promotional_Influencer__c', 'NNAE_Total_of_BioPharm_Patients__c', \
+'NNAE_Total_of_insulin_patients__c', 'NNAE_Total_of_Obese_patients__c', \
+'NNEU_Core_TotalOfDiabetesPatients__c', 'NNAE_Promotional_Speaker__c', \
+'NNAE_Pathways_Driven_Health_System__c', 'NNEU_Core_SpeakerTrained__c', \
+'NNAE_Digital_Preference__c', 'NNAE_Digital_Channels__c', 'NNEU_Core_TypeOfPrescriber__c', \
+'NNEU_Core_KAM_BehaviouralSegment__c', 'NNAE_AOM_Usage__c', 'NNAE_Type_of_HCP__c', \
+'NNAE_Guidelines_Pathways_Adherence__c', 'NNAE_Prescriber_Basal_Bolus__c', \
+'NNAE_Prescriber_GLP_1__c', 'NNEU_Core_PrescriberBasal__c', 'NNEU_Core_PrescriberBolus__c', \
+'NNEU_Core_PrescriberDPP4__c', 'NNEU_Core_PrescriberMix__c', 'NNEU_Core_PrescriberSGLT2__c', \
+'NNAE_KeyAccount__c', 'NNAE_IsHMO__c', 'OCE__CountryCode__c', 'NNAE_UniqueIntegrationId__c', \
+'NNAE_VBH_Contracts__c', 'NNAE_Population_Covered__c', 'NNAE_Average_Age_Population__c', \
+'NNAE_Fee_Income_patient__c', 'NNAE_Population_Churn__c', 'NNAE_Quality_Metrics_Importance__c', \
+'NNAE_Performance_Key_Quality_Metrics__c', 'NNAE_Decision_Making_Perspective__c', \
+'NNAE_DiabetesChronicDiseaseProgInPlace__c', 'NNAE_ObesityChronicDiseaseInPlace__c', \
+'NNAE_HaemophiliaChronicDiseaseInPlace__c', 'NNAE_hGHChronicDiseaseInPlace__c', \
+'NNAE_TypeCoverage__c', 'NNAE_SpeedOfAccessTreatments__c', 'NNAE_LevelOfAccessTreatments__c', \
+'NNAE_HasPatientLevelPharmacyData__c', 'NNAE_QualityElectronicPatientsRec__c', \
+'NNAE_NN_ShareOfSales__c', 'NNAE_ChannelsHMO_OperatesIn__c', 'NNAE_IsWholesalerOrDistributor__c', \
+'NNAE_PurchaseChannel__c', 'NNAE_AssociatedHCPsNNDiabetesPanel__c', \
+'NNAE_AssociatedHCPsNNObesityPanel__c', 'NNAE_AssociatedHCPsNNBiopharmPanel__c', \
+'NNAE_StrengthFormularyEnforcement__c', 'NNAE_FinancialHealth__c', 'NNAE_HCO_Condition__c', \
+'NNAE_SFDC_ID__c', 'NNAE_Non_One_Key_ID__c', 'OCE__SectorCode__c', 'Phone','LastModifiedDate',\
+'GI_OneKey_Status__c','OCE__ProfessionalTitle__c','MiddleName','OCE__IndividualTypes__c','NNAE_ObesityAttitudinal__c','NNAE_IntegrationID__c' ,\
+'NNAE_Hcp_Portal__c','NNAE_Core_eRepresentative__c','NNAE_Core_Broadcast_Email__c','NNAE_Core_Meetings__c','NNAE_Core_eCongress__c', \
+'NNAE_Social_Media__c','NNAE_Scientific_Influence_Diabetes__c','NNAE_Scientific_Influence_Obesity__c',   \
+'NNAE_Scientific_Influence_GrowthDisorder__c','NNAE_Scientific_Influence_Haemophilia__c','NNAE_ScientificInfluence_Sicklecelldisea__c','NNAE_ScientificInfluenceOtherRareDiseas__c', \
+'NNAE_Scientific_Influence_Nash__c','NNAE_Scientific_Influence_CardioVascular__c','NNAE_ScientificInfluenceAlzheimerDisease__c','NNAE_Digital_Segmentation__c', \
+'NNAE_Medical_Focused_Account__c','NNAE_Digital_Opinion_Leader__c'])
+ACCNTADDR_COLS = (['OCE__Account__c', 'OCE__Address__c', 'OCE__IsPrimary__c', \
+'OCE__FormattedAddress__c', 'OCE__Email__c', 'NNEU_Core_BrickCode__c', 'OCE__IsActive__c', \
+'NNAE_Brick_1__c', 'NNAE_Brick_2__c', 'NNAE_Brick_3__c', 'NNAE_Brick_1_Label__c', \
+'NNAE_Brick_2_Label__c', 'NNAE_Brick_3_Label__c','LastModifiedDate','OCE__WorkPlace__c'])
+ADDR_COLS = (['Id', 'OCE__Brick__c', 'OCE__DisplayAddress__c', 'OCE__State__c', 'OCE__City__c', \
+'OCE__District__c', 'OCE__Country__c', 'OCE__ZipCode__c', 'OCE__UniqueIntegrationID__c'])
+PRD_COLS = (['Id', 'Name', 'OCE__ParentProduct__c', 'RecordTypeId', 'OCE__TherapeuticArea__c', \
+'OCE__DTP__c', 'OCE__IsActive__c', 'Division','NNAE_Global_Product__c'])
+RECTYPE_COLS = ['Id', 'Name', 'DeveloperName']
+TRT_COLS = (['Id', 'Name', 'MirrorTerritory__c', 'UserNameOfMirrorTerritory__c', \
+'ParentTerritory2Id', 'SystemModstamp', 'NN_Core_PositionType__c', 'NNAE_Organization__c'])
+USERTRT_COLS = ['UserId', 'Territory2Id', 'IsActive']
+ACCTTRT_COLS = (['OCE__Territory__c', 'OCE__Account__c', 'IsDeleted', 'NNAE_Target_Class__c', \
+'NNAE_Sub_Target__c', 'Id'])
+USR_COLS = (['OCE__IsLoggingEnabled__c', 'ManagerId', 'Id', 'Username', 'LastName', \
+'TimeZoneSidKey', 'FirstName', 'Name', 'CompanyName', 'Division', 'Department', 'Title', \
+'Street', 'City', 'State', 'PostalCode', 'Country', 'Latitude', 'Longitude', 'Email', 'Alias', \
+'IsActive', 'ProfileId', 'LanguageLocaleKey', 'EmployeeNumber','LastModifiedDate'])
+PROF_COLS = ['Id', 'Name']
+OCP_TC_COLS = ['Target Class', 'Sub Target Class']
+AFF_COLS = (['AFFILIATE_ID', 'ORGANIZATION', 'LANGUAGE', 'COUNTRY', 'AFFILIATE', 'REGION', \
+'BUSINESS_AREA'])
+FC_COLS = (['Id', 'OwnerId', 'OCE__User__c', 'OCE__NumberOfCoachingCalls__c', \
+'OCE__StartDate__c', 'OCE__EndDate__c', 'OCE__Status__c', 'OCE__FinishedDate__c', \
+'OCE__AcknowledgedDate__c', 'OCE__TemplateName__c', 'CreatedDate', 'OCE__OfflineCreatedByID__c', \
+'CreatedById','NNAE_Duration__c','NNAE_Note__c','NNAE_Action_Plan__c','NNAE_Action_Date__c'])
+FCD_COLS = (['OCE__FieldCoachingEvent__c', 'OCE__Question__c', 'OCE__CoachScore__c', \
+'OCE__Category__c', 'OCE__EmployeeCommentsLong__c', 'OCE__ManagersCommentsLong__c', \
+'OCE__SelfEvaluationScore__c'])
+ATP_COLS = (['Id', 'OCE__Account__c', 'OCE__Product__c', 'NNEU_Core_TargetClass__c', \
+'NNAE_Sub_Target__c', 'NNEU_Core_ScientificAwareness__c', 'NNEU_Core_AdoptionLadder__c', \
+'NNEU_Core_ProductSpeakerTrained__c', 'NNAE_Territory__c', 'LastModifiedDate', \
+'NNAE_Frequency__c', 'NNAE_Segmentation__c', 'CreatedDate', 'NNAE_Clinical_Experience__c', \
+'NNAE_Scientific_Advocacy__c', 'NNEU_Core_SourceOfPatients__c', 'NNAE_Interest_in_Samples__c','NNAE_NN_Investigator__c'])
+CALL_COLS = (['Id', 'OCE__CallType__c', 'OCE__Status__c', 'OCE__Account__c', 'OwnerId', \
+'OCE__CallDateTime__c', 'OCE__EndCallDateTime__c', 'CreatedDate', 'OCE__SubmissionDate__c', \
+'NNEU_Core_CallNotes__c', 'OCE__NextCallObjective__c', 'OCE__Territory__c', 'OCE__Channel__c', \
+'NNAAMEO_Accompanied_By__c', 'LastModifiedDate', 'IsDeleted', 'NNAE_Call_Type__c', \
+'NNAE_Call_Type_2__c', 'Name', 'RecordTypeId', 'OCE__InvitationStatus__c', 'OCE__ParentCall__c', \
+'NNAE_Total_number_of_Attendees__c', 'NNAE_Off_Label_Call_Note__c', 'OCE__DurationPicklist__c', \
+'OCE__OfflineCreatedByID__c', 'CreatedById', 'OCE__IsGroupCall__c', 'OCE__Meeting__c'])
+CALLDLG_COLS = ['OCE__CallDetail__c', 'OCE__SurveyInvitation__c', 'Id']
+PER_COLS = ['Id', 'OCE__StartDate__c']
+PC_COLS = ['Id', 'OCE__Period__c', 'OCE__Territory__c', 'OwnerId']
+AP_COLS = (['OCE__AccountGoal__c', 'OCE__HQGoal__c', 'NNAE_Sub_target_Class__c', \
+'OCE__ActivityPlanConfigName__c', 'NNAE_Target_Class__c', 'NNAE_Therapy_Area_Product__c', \
+'OCE__Actual__c', 'Id'])
+AG_COLS = ['OCE__Account__c', 'OCE__PlanCycle__c', 'Id']
+TPA_COLS = ['OCE__Territory__c', 'OCE__Product__c']
+SVQR_COLS = (['OCE__QuestionText__c', 'OCE__ResponseText__c', 'OCE__SurveyResponse__c', \
+'OCE__Response__c', 'OCE__CallDialogue__c', 'OCE__SurveyInvitation__c'])
+SVR_COLS = (['Id', 'CreatedDate', 'OCE__Account__c', 'OCE__Survey__c', 'OCE__Completion__c', \
+'OCE__Status__c', 'OwnerId', 'OCE__Type__c', 'Name', 'OCE__Call__c','LastModifiedDate'])
+SV_COLS = ['Id', 'Name']
+SVI_COLS = ['Id', 'Name']
+LANG_COLS = ['Value', 'Language_code', 'Translation', 'Object', 'Field']
+DIV_COLS = ['Id', 'Name']
+EMAIL_TR_COLS = (['Id', 'CreatedDate', 'OwnerId', 'IsDeleted', 'OCE__Account__c', 'Name', \
+'OCE__AttachmentNames__c', 'OCE__EmailBouncedDate__c', 'OCE__EmailBouncedReason__c', \
+'OCE__EmailResponseStatus__c', 'OCE__EmailStatus__c', 'OCE__EmailStatusDate__c', \
+'OCE__EmailTemplate__c', 'OCE__FirstOpenedDate__c', 'OCE__LastClickedDate__c', \
+'OCE__LastOpenedDate__c', 'OCE__LatestTrackingEventDate__c', 'OCE__MessageStatus__c', \
+'OCE__Sender__c', 'OCE__SentDate__c', 'OCE__SentTo__c', 'OCE__Subject__c', \
+'OCE__EmailQueue__c', 'OCE__TimesOpened__c'])
+EMAIL_TEMP_COLS = (['Id', 'Name', 'OCE__Product__c', 'OCE__Description__c', 'OCE__Topic__c', \
+'OCE__AttachICSFile__c', 'OCE__EndDate__c', 'OCE__IsActive__c'])
+MCQ_COLS = ['Affiliate','Channel','Status','Month_Id','Contact','MCQs']
+NN_GLB_PRD_COLS = ['Id','Name']
+
+def csv_dataframe(prefix, encoding, columns):
+    s3resource = boto3.resource('s3')
+    bucket = s3resource.Bucket(SRCBUCKET)
+    prefix_objs = bucket.objects.filter(Prefix=prefix)
+    prefix_df = []
+    filter_cols = ['Id', 'LastModifiedDate']
+    for obj in prefix_objs:
+        if '.csv' in obj.key:
+            body = obj.get()['Body'].read().decode(encoding)
+            df = (pd.read_csv(io.StringIO(body), quotechar='"', sep='\t', dtype='str', \
+            on_bad_lines='skip', usecols=columns+filter_cols))
+            prefix_df.append(df)
+    DF = pd.concat(prefix_df).sort_values(by='LastModifiedDate')
+    DF = DF.drop_duplicates(['Id'], keep='last')[columns]
+    return DF
+
+def uploadCSV(OBJ_PATH, FINAL_DF):
+#Make sure that boto3 module is imported and s3 resource is referred
+    DESTBUCKET = WH_BUCKET
+    DESTMASTERPATH = 'ioengage/data/aameo/{0}/csv/'.format(env)
+    if not FINAL_DF.empty:
+        csv_buffer = io.StringIO()
+        (FINAL_DF.to_csv(csv_buffer, sep=',', quotechar='"', encoding='utf-8', quoting=csv.QUOTE_ALL, \
+        index=False))
+        S3RESOURCE.Object(DESTBUCKET, DESTMASTERPATH+OBJ_PATH).put(Body=csv_buffer.getvalue())
+        print("loaded "+OBJ_PATH)
+    else:
+        print(OBJ_PATH+' is Empty')
+
+def get_child_list(df, parent_id):
+    list_of_children = []
+    list_of_children.append(df[df['ParentTerritory2Id'] == parent_id]['Id'].values)
+    
+    for i_, r_ in df[df['ParentTerritory2Id'] == parent_id].iterrows():
+        if r_['Id'] != parent_id:
+            list_of_children.append(get_child_list(df, r_['Id']))
+    list_of_children = [item for sublist in list_of_children for item in sublist]
+    return list_of_children
+
+#Reading XLSX content
+OCP_DATA = S3.get_object(Bucket='victoria-prd-s3-eu-reference', Key=OCPPATH)
+OCP_CONTENTS = OCP_DATA['Body'].read()
+OCP_CP_DF = (pd.read_excel(io.BytesIO(OCP_CONTENTS),  \
+sheet_name='CALL PLAN TARGETS'))
+TA_PRD_DF = (pd.read_excel(io.BytesIO(OCP_CONTENTS),  \
+sheet_name='THERAPY_AREA_TO_PRODUCT'))
+TA_PRD_DF.columns = ['Therapy_Area', 'Product_Name']
+UP_AREA_DF = (pd.read_excel(io.BytesIO(OCP_CONTENTS),  \
+sheet_name='USER_PROFILE_TO_PERSONA'))
+MCQ_DF = (pd.read_excel(io.BytesIO(OCP_CONTENTS),  \
+sheet_name='MCQ'))
+MCQ_AFF_List = MCQ_DF['Affiliate'].unique()
+
+AFF_OBJ = S3.get_object(Bucket=WH_BUCKET, Key=AFFPATH)
+AFF_STRING = AFF_OBJ['Body'].read().decode('utf-8')
+AFF_DF = (pd.read_csv(io.StringIO(AFF_STRING), quotechar='"', sep=',', on_bad_lines='skip', \
+usecols=AFF_COLS, dtype=str).drop_duplicates())
+
+LOC_LAN_OBJ = (S3.get_object(Bucket='victoria-prd-s3-eu-reference', \
+Key='ioengage/aameo/admin/AAMEO-LANGUAGE-TRANSLATION.csv'))
+LOC_LAN_STR = LOC_LAN_OBJ['Body'].read().decode('utf-8')
+LOC_LAN_DF = (pd.read_csv(io.StringIO(LOC_LAN_STR), quotechar='"', sep=',', on_bad_lines='skip', \
+usecols=LANG_COLS, dtype=str).drop_duplicates())
+
+TC_OBJ = S3.get_object(Bucket=WH_BUCKET, Key=TC_PATH)
+TC_STRING = TC_OBJ['Body'].read().decode('utf-8')
+TC_DF = (pd.read_csv(io.StringIO(TC_STRING), quotechar='"', sep=',', on_bad_lines='skip', \
+dtype=str))
+TC_DF.columns = ['TARGETCLASS_ID', 'TARGET_CLASS', 'SUB_TARGET_CLASS', 'LAST_REFRESHED_DATE']
+
+bucket1 = boto3.resource('s3').Bucket(WH_BUCKET)
+TRT_D_objs = bucket1.objects.filter(Prefix='ioengage/data/aameo/{0}/csv/wh-territory-d/'.format(env))
+TRT_prefix_df = []
+for obj in TRT_D_objs:
+    if '.csv' in obj.key:
+        body = obj.get()['Body'].read().decode('utf-8')
+        df = (pd.read_csv(io.StringIO(body), quotechar='"', sep=',', dtype='str', \
+        on_bad_lines='skip'))
+        TRT_prefix_df.append(df)
+
+TRT_FD_HIST_DF = (pd.concat(TRT_prefix_df).sort_values(by='MONTH_ID')[['Name', 'UserId', 'MONTH_ID', \
+'LastModifiedDate']].drop_duplicates())
+TRT_HIST_DF = TRT_FD_HIST_DF[['Name', 'UserId', 'MONTH_ID']].drop_duplicates()
+TRT_HIST_DF.columns = ['TERRITORY', 'OCE__User__c', 'MONTH_ID']
+
+def wh_account():
+    """Function to create WH_ACCOUNT and WH_ACCOUNTADDRESS TABLE"""
+    LOC_SPEC_DF = (LOC_LAN_DF[LOC_LAN_DF['Object'].isin(['Account'])&LOC_LAN_DF['Field']\
+    .isin(['OCE__Specialty__c'])][['Value', 'Language_code', 'Translation']])
+    LOC_SPEC_DF.columns = ['OCE__Specialty__c', 'Language_code', 'SPEC_TRANSLATION']
+    LOC_SPEC2_DF = (LOC_LAN_DF[LOC_LAN_DF['Object'].isin(['Account'])&LOC_LAN_DF['Field']\
+    .isin(['OCE__Specialty__c'])][['Value', 'Language_code', 'Translation']])
+    LOC_SPEC2_DF.columns = ['OCE__Specialty2__c', 'Language_code', 'SPEC2_TRANSLATION']
+    LOC_SPEC3_DF = (LOC_LAN_DF[LOC_LAN_DF['Object'].isin(['Account'])&LOC_LAN_DF['Field']\
+    .isin(['OCE__Specialty__c'])][['Value', 'Language_code', 'Translation']])
+    LOC_SPEC3_DF.columns = ['OCE__Specialty3__c', 'Language_code', 'SPEC3_TRANSLATION']
+    LOC_SI_DF = (LOC_LAN_DF[LOC_LAN_DF['Object'].isin(['Account'])&LOC_LAN_DF['Field']\
+    .isin(['NNAE_Scientific_Influencer__c'])][['Value', 'Language_code', 'Translation']])
+    LOC_SI_DF.columns = ['NNAE_Scientific_Influencer__c', 'Language_code', 'SI_TRANSLATION']
+    LOC_KOL_DF = (LOC_LAN_DF[LOC_LAN_DF['Object'].isin(['Account'])&LOC_LAN_DF['Field']\
+    .isin(['NNAE_Scientific_Influencer__c'])][['Value', 'Language_code', 'Translation']])
+    LOC_KOL_DF.columns = ['KOL_FLAG', 'Language_code', 'KOL_FLAG_TRANSLATION']
+    ACCNT_DF = (spark.read.option("header", True).option("delimiter","\t").format("csv")\
+    .load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/ACCOUNT/*.csv".format(env))\
+    .select(ACCNT_COLS))
+    ACCNT_DF = ACCNT_DF.withColumnRenamed("NNAE_Language__c","Language_code")
+    ACCNT_DF = ACCNT_DF.toPandas()
+    ACCNT_DF['KOL_FLAG'] = ''
+    ACCNT_DF.loc[ACCNT_DF['OCE__IsKOL__c'].isin(['True']), 'KOL_FLAG'] = 'KOL'
+    ACCNT_DF.loc[ACCNT_DF['OCE__IsKOL__c'].isin(['False']), 'KOL_FLAG'] = 'Non-KOL'
+    ACCNT_DF['ONEKEY_FLAG'] = 'Non-OneKey'
+    ACCNT_DF.loc[ACCNT_DF['OCE__RecordTypeName__c'].isin(['Department', 'GPO (Group Purchasing Organization)', 'IDN (Integrated Delivery Network)', 'Institution', 'MP (Medical Professional)', 'Pharmacy', 'Practice', 'Wholesaler']), 'ONEKEY_FLAG'] = 'OneKey'
+    ACCNT_DF['UNIQUE_INTEGRATION_ID'] = np.where(ACCNT_DF['ONEKEY_FLAG'].isin(['OneKey']), ACCNT_DF['NNAE_IntegrationID__c'], ACCNT_DF['NNAE_UniqueIntegrationId__c'])
+    ACCNT_TR_DF = (pd.merge(pd.merge(pd.merge(pd.merge(pd.merge(ACCNT_DF, LOC_SPEC_DF, \
+    on=['OCE__Specialty__c', 'Language_code'], how='left'), LOC_SI_DF, \
+    on=['NNAE_Scientific_Influencer__c', 'Language_code'], how='left'), LOC_KOL_DF, \
+    on=['KOL_FLAG', 'Language_code'], how='left'), LOC_SPEC2_DF, \
+    on=['OCE__Specialty2__c', 'Language_code'], how='left'), LOC_SPEC3_DF, \
+    on=['OCE__Specialty3__c', 'Language_code'], how='left'))
+    ACCNT_TR_DF['SPEC_TRANSLATION'] = (ACCNT_TR_DF['SPEC_TRANSLATION']\
+    .fillna(ACCNT_TR_DF['OCE__Specialty__c']))
+    ACCNT_TR_DF['SPEC2_TRANSLATION'] = (ACCNT_TR_DF['SPEC2_TRANSLATION']\
+    .fillna(ACCNT_TR_DF['OCE__Specialty2__c']))
+    ACCNT_TR_DF['SPEC3_TRANSLATION'] = (ACCNT_TR_DF['SPEC3_TRANSLATION']\
+    .fillna(ACCNT_TR_DF['OCE__Specialty3__c']))
+    ACCNT_TR_DF['SI_TRANSLATION'] = (ACCNT_TR_DF['SI_TRANSLATION']\
+    .fillna(ACCNT_TR_DF['NNAE_Scientific_Influencer__c']))
+    ACCNT_TR_DF['KOL_FLAG_TRANSLATION'] = (ACCNT_TR_DF['KOL_FLAG_TRANSLATION']\
+    .fillna(ACCNT_TR_DF['KOL_FLAG']))
+    ACCNTADDR_DF = (spark.read.option("header", True).option("delimiter","\t").format("csv")\
+    .load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__ACCOUNTADDRESS__C/*.csv"\
+    .format(env)).select(ACCNTADDR_COLS))
+    ACCNTADDR_DF = ACCNTADDR_DF[ACCNTADDR_DF['OCE__IsActive__c'].isin(['True'])]
+    ACCNTADDR_DF = ACCNTADDR_DF.toPandas()
+    ACCNTADDR_DF = ACCNTADDR_DF.rename({'LastModifiedDate':'ACCNT_ADD_LastModifiedDate'}, axis=1)
+    ACCNTADDR_DF1 = ACCNTADDR_DF.drop(['OCE__Email__c', 'OCE__IsActive__c'], axis=1)
+    RECTYPE_DF = csv_dataframe(RECTYPEPATH, 'utf-8', ['Id', 'DeveloperName'])
+    RECTYPE_DF = RECTYPE_DF.rename({'Id':'RecordTypeId'}, axis=1)
+    ADDR_DF = (spark.read.option("header", True).option("delimiter","\t").format("csv")\
+    .load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__ADDRESS__C/*.csv"\
+    .format(env)).select(ADDR_COLS))
+    ADDR_DF = ADDR_DF.toPandas()
+    Rec_Count = 0
+    for g, df in ACCNT_TR_DF.groupby(np.arange(len(ACCNT_TR_DF)) // 100000):
+        Rec_Count = Rec_Count+1
+        ACNT_FIN_DF = (pd.merge(pd.merge(df, ACCNTADDR_DF1[ACCNTADDR_DF1.OCE__IsPrimary__c.isin(['True'])],\
+        left_on='Id', right_on='OCE__Account__c', how='left'), RECTYPE_DF, on='RecordTypeId', how='left')\
+        .drop(['OCE__Account__c', 'RecordTypeId'], axis=1))
+        ACNT_FIN_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+        ACNT_FIN_DF = (ACNT_FIN_DF[['FirstName', 'Id', 'LastName', 'NNEU_Core_BehaviouralSegment__c', \
+        'NNEU_Core_InfluenceLevelTier__c', 'NNEU_Core_TotalOfPatientsAll__c', \
+        'Name', 'PersonEmail', 'OCE__IsKOL__c', 'NNAE_IntegrationID__c', \
+        'OCE__ParentAccount__c', 'SPEC_TRANSLATION', 'OCE__Status__c', 'OCE__Type__c', \
+        'OCE__WorkPhone__c', 'OwnerId', 'PersonTitle', 'OCE__FormattedAddress__c', \
+        'NNAE_National_ID__c', 'NNEU_Core_OKC_LicenseNumber__c', 'OCE__Specialty2__c', \
+        'OCE__Specialty3__c', 'IsPersonAccount', 'OCE__IMSID__c', \
+        'NNAE_Non_One_Key_ID_Admin_Created__c', 'NNAE_PL_Non_One_Key_ID__c', \
+        'SI_TRANSLATION', 'NNEU_Core_InvestorExperience__c', \
+        'NNEU_Core_RisingStar__c', 'OCE__IsActive__c', 'DeveloperName', \
+        'OCE__RecordTypeName__c', 'NNEU_Core_PopulationResponsibleFor__c', \
+        'NNEU_Core_DrugBudgetResponsibilityAmount__c', 'NNAE_Access_Influencer__c', \
+        'NNEU_Core_FormularyInfluenceReference__c', 'NNEU_Core_FormularySubmitter__c', \
+        'NNEU_Core_InitiatorbyTherapies__c', 'NNAE_Guidelines_Pathways__c', \
+        'NNAE_Access_Speaker__c', 'NNEU_Core_IndustryAccess__c', 'NNEU_Core_ServiceDevelopment__c', \
+        'NNEU_Core_HCPFormularyAdherence__c', 'NNEU_Core_GuidelinePathwayAdherence__c', \
+        'NNEU_Core_PolicyDrivenHealthSystem__c', 'Salutation', 'OCE__Gender__c', \
+        'OCE__UltimateParentAccount__c', 'NNAE_Webinars__c', 'NNAE_Initiator_by_Class__c', \
+        'NNAE_Behavioural_segment__c', 'NNAE_Target_by_Role__c', 'NNAE_PreApprovedEmail__c', \
+        'NNAE_PhoneEngagement__c', 'NNAE_RemoteEngagement__c', 'NNAE_Promotional_Influencer__c', \
+        'NNAE_Total_of_BioPharm_Patients__c', 'NNAE_Total_of_insulin_patients__c', \
+        'NNAE_Total_of_Obese_patients__c', 'NNEU_Core_TotalOfDiabetesPatients__c', \
+        'NNAE_Promotional_Speaker__c', 'NNAE_Pathways_Driven_Health_System__c', \
+        'NNEU_Core_SpeakerTrained__c', 'NNAE_Digital_Preference__c', 'NNAE_Digital_Channels__c', \
+        'NNEU_Core_TypeOfPrescriber__c', 'NNEU_Core_KAM_BehaviouralSegment__c', 'OCE__Specialty__c', \
+        'NNAE_AOM_Usage__c', 'NNAE_Type_of_HCP__c', 'NNAE_Guidelines_Pathways_Adherence__c', \
+        'NNAE_Prescriber_Basal_Bolus__c', 'NNAE_Prescriber_GLP_1__c', 'NNEU_Core_PrescriberBasal__c', \
+        'NNEU_Core_PrescriberBolus__c', 'NNEU_Core_PrescriberDPP4__c', 'NNEU_Core_PrescriberMix__c', \
+        'NNEU_Core_PrescriberSGLT2__c', 'NNAE_KeyAccount__c', 'NNAE_IsHMO__c', 'KOL_FLAG', \
+        'KOL_FLAG_TRANSLATION','OCE__CountryCode__c', 'ONEKEY_FLAG', 'UNIQUE_INTEGRATION_ID', \
+        'NNAE_VBH_Contracts__c', 'NNAE_Population_Covered__c', 'NNAE_Average_Age_Population__c', \
+        'NNAE_Fee_Income_patient__c', 'NNAE_Population_Churn__c', \
+        'NNAE_Quality_Metrics_Importance__c', 'NNAE_Performance_Key_Quality_Metrics__c', \
+        'NNAE_Decision_Making_Perspective__c', 'NNAE_DiabetesChronicDiseaseProgInPlace__c', \
+        'NNAE_ObesityChronicDiseaseInPlace__c', 'NNAE_HaemophiliaChronicDiseaseInPlace__c', \
+        'NNAE_hGHChronicDiseaseInPlace__c', 'NNAE_TypeCoverage__c', \
+        'NNAE_SpeedOfAccessTreatments__c', 'NNAE_LevelOfAccessTreatments__c', \
+        'NNAE_HasPatientLevelPharmacyData__c', 'NNAE_QualityElectronicPatientsRec__c', \
+        'NNAE_NN_ShareOfSales__c', 'NNAE_ChannelsHMO_OperatesIn__c', \
+        'NNAE_IsWholesalerOrDistributor__c', 'NNAE_PurchaseChannel__c', \
+        'NNAE_AssociatedHCPsNNDiabetesPanel__c', 'NNAE_AssociatedHCPsNNObesityPanel__c', \
+        'NNAE_AssociatedHCPsNNBiopharmPanel__c', 'NNAE_StrengthFormularyEnforcement__c', \
+        'NNAE_FinancialHealth__c', 'NNAE_HCO_Condition__c', 'NNAE_SFDC_ID__c', \
+        'NNAE_Non_One_Key_ID__c', 'SPEC2_TRANSLATION', 'SPEC3_TRANSLATION', \
+        'LAST_REFRESHED_DATE', 'Phone','LastModifiedDate','GI_OneKey_Status__c', \
+        'OCE__ProfessionalTitle__c','MiddleName','OCE__IndividualTypes__c','NNAE_ObesityAttitudinal__c', \
+        'NNAE_Hcp_Portal__c','NNAE_Core_eRepresentative__c','NNAE_Core_Broadcast_Email__c','NNAE_Core_Meetings__c','NNAE_Core_eCongress__c', \
+        'NNAE_Social_Media__c','NNAE_Scientific_Influence_Diabetes__c','NNAE_Scientific_Influence_Obesity__c', \
+        'NNAE_Scientific_Influence_GrowthDisorder__c','NNAE_Scientific_Influence_Haemophilia__c','NNAE_ScientificInfluence_Sicklecelldisea__c','NNAE_ScientificInfluenceOtherRareDiseas__c', \
+        'NNAE_Scientific_Influence_Nash__c','NNAE_Scientific_Influence_CardioVascular__c','NNAE_ScientificInfluenceAlzheimerDisease__c','NNAE_Digital_Segmentation__c', \
+        'NNAE_Medical_Focused_Account__c','NNAE_Digital_Opinion_Leader__c','NNAE_Scientific_Influencer__c']].drop_duplicates())
+        uploadCSV('wh-account/wh-account-'+str(Rec_Count)+'.csv', ACNT_FIN_DF)
+    ACADR_FIN_DF = (pd.merge(ACCNTADDR_DF, ADDR_DF, left_on='OCE__Address__c', right_on='Id')\
+    .drop(['Id'], axis=1))
+    ACCNT_DF1 = csv_dataframe(ACCNTPATH, 'utf-8', ['Id', 'OCE__SectorCode__c'])
+    ACCNT_DF1 = ACCNT_DF1.rename({'Id':'Acc_Id'}, axis=1)
+    ACADR_FIN_DF = pd.merge(ACCNT_DF1, ACADR_FIN_DF, left_on='Acc_Id', right_on='OCE__Account__c', how='left')
+    ACADR_FIN_DF['REGION'] = 'AAMEO'
+    ACADR_FIN_DF['ZONE'] = ''
+    ACADR_FIN_DF['IMS_Address_ID'] = ''
+    ACADR_FIN_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    ACADR_FIN_DF = (ACADR_FIN_DF[['OCE__Account__c', 'OCE__Address__c', 'OCE__IsPrimary__c', \
+    'NNEU_Core_BrickCode__c', 'OCE__City__c', 'OCE__Country__c', 'OCE__DisplayAddress__c', \
+    'OCE__District__c', 'OCE__State__c', 'OCE__ZipCode__c', 'REGION', 'ZONE', 'IMS_Address_ID', \
+    'OCE__UniqueIntegrationID__c', 'OCE__Email__c', 'NNAE_Brick_1__c', 'NNAE_Brick_2__c', \
+    'NNAE_Brick_3__c', 'NNAE_Brick_1_Label__c', 'NNAE_Brick_2_Label__c', 'NNAE_Brick_3_Label__c',\
+    'OCE__SectorCode__c', 'LAST_REFRESHED_DATE','ACCNT_ADD_LastModifiedDate','OCE__WorkPlace__c']])
+    uploadCSV('wh-account-address/wh-account-address.csv', ACADR_FIN_DF)
+
+def wh_product():
+    """Function to create WH_PRODUCT and WH_THERAPY_AREA TABLE"""
+    TA_GRP_DF = (pd.read_excel(io.BytesIO(OCP_CONTENTS), \
+    sheet_name='THERAPY_AREA_GROUP'))
+    TA_GRP_DF.columns = ['Name', 'TA_GROUP']
+    PROD_DF = csv_dataframe(PRDPATH, 'utf-8', PRD_COLS)
+    PROD_DF = PROD_DF.dropna(axis=0, how='any',subset=['Name'])
+    RECTYPE_DF = csv_dataframe(RECTYPEPATH, 'utf-8', RECTYPE_COLS)
+    GLB_PRD_DF = csv_dataframe(NN_GLB_PRD_PATH, 'utf-8', NN_GLB_PRD_COLS)
+    GLB_PRD_DF = GLB_PRD_DF.rename({'Id':'NNAE_Global_Product__c','Name':'Global_Name'}, axis=1)
+    RECTYPE_DF = RECTYPE_DF.rename({'Name':'Record_type', 'Id':'RecordTypeId'}, axis=1)
+    PRD_DF = (PROD_DF[['Id', 'Name', 'OCE__ParentProduct__c', 'RecordTypeId', \
+    'OCE__TherapeuticArea__c','NNAE_Global_Product__c']])
+    PRD_DF = PRD_DF.rename({'Id':'Product_Id', 'Name':'Product_Name'}, axis=1)
+    CHILD_DF = (pd.merge(PRD_DF, RECTYPE_DF, on='RecordTypeId')\
+    .drop(['RecordTypeId', 'OCE__TherapeuticArea__c'], axis=1))
+    PAR_DF = CHILD_DF[['Product_Id', 'Product_Name']]
+    PAR_DF.columns = ['Par_Product_Id', 'Par_Product_Name']
+    PROD_FIN_DF = (pd.merge(CHILD_DF, PAR_DF, left_on='OCE__ParentProduct__c', \
+    right_on='Par_Product_Id', how='left').drop(['Par_Product_Id'], axis=1))
+    PROD_FIN_DF['Molecule'] = ''
+    PROD_FIN_DF['Segment'] = ''
+    PROD_FIN_DF['Brand'] = ''
+    PROD_FIN_DF['Speciality'] = ''
+    PROD_FIN_DF['Product_Lower_Case'] = PROD_FIN_DF['Product_Name'].str.lower()
+    for i in range(len(PROD_FIN_DF)):
+
+        if re.search('catride', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Catridecacog'
+        if re.search('conciz', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Concizumab'    
+        if re.search('(bas|bb|insu|premix|ouest|dt1|intensification|mi)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Insulin Other'    
+        if re.search('bol', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Insulin Other'
+        if re.search('deg', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Degludec' 
+        if re.search('esp', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Esperoct'
+        if re.search('evi', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Eviana'    
+        
+        if re.search('(fia|faster)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Fiasp'
+        if re.search('(glp-1|glp1)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='GLP-1 Other'    
+        
+        if re.search('gluc', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Glucagen'
+        
+        if re.search('(gh|growth hormone)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='HGH Other'
+        if re.search('(hi|human ins)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Human Insulin'    
+        if re.search('(hemop|heamop)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Haemophilia Other'    
+        if re.search('icodec', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Icodec'    
+        
+        if re.search('idegl', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Ideglira'
+        if re.search('insulatard', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Insulatard'
+        if re.search('leve', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Levemir'
+        if re.search('nash', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Nash'    
+        if re.search('mixt', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Mixtard'
+        if re.search('nord', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Norditropin'
+        if re.search('novoe', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='NovoEight' 
+        if re.search('novom', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='NovoMix'
+        if re.search('novon', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Novonorm'
+        
+        if re.search('novor', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='NovoRapid'
+        if re.search('novos', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='NovoSeven'
+        if re.search('novot', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='NovoThirteen'
+        if re.search('obes|obs', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Obesity Other'
+        if re.search('oral sema', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Ozempic'    
+        if re.search('(ozem|semaglutide)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Ozempic'
+        if re.search('(biopharm|haem)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='RareD Other'    
+        if re.search('(rfviia|eptacog)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='rfVIIa'
+        if re.search('ref', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Refixia'
+        if re.search('ryb', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Rybelsus'
+        if re.search('ryz', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Ryzodeg' 
+        if re.search('sax', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Saxenda' 
+        if re.search('(sog|soma)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Sogroya'   
+        if re.search('sult', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Xultophy'
+        if re.search('treg', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Tregludec' 
+        if re.search('tres', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Tresiba'
+        if re.search('turoctocog alfa', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Turoctocog alfa'
+        if re.search('turoctocog alfa pegol', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Turoctocog alfa pegol'    
+        
+        if re.search('vag', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Vagifem'
+        if re.search('(vic|liraglutide)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Victoza'
+        if re.search('weg', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Wegovy'
+        if re.search('xul', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Xultophy'  
+        if re.search('actr', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Actrapid'
+        if re.search('acta', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Actapid' 
+        if re.search('novof', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='NovoFine'
+        if re.search('(flexp|flext|novop|pentagon|penf|device)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Devices'
+        
+        if re.search('оземпик®', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Ozempic'    
+        if re.search('(тресиба®|тресиба fsm)', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Tresiba'    
+        if re.search('райзодег®', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Ryzodeg'
+        if re.search('ребелсас®', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Rybelsus'
+        if re.search('саксенда®', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Saxenda'
+        if re.search('фиасп®', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Fiasp'
+        if re.search('левемир®', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Levemir'
+        if re.search('новорапид®', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='NovoRapid'
+        if re.search('партнер rus', PROD_FIN_DF['Product_Lower_Case'].iloc[i]):
+            PROD_FIN_DF['Brand'].iloc[i]='Tresiba'
+    
+    for i in range(len(PROD_FIN_DF)):
+        if PROD_FIN_DF['Brand'].iloc[i]=='':
+            PROD_FIN_DF['Brand'].iloc[i]='Others'
+    PROD_FINAL_GLB = pd.merge(PROD_FIN_DF, GLB_PRD_DF, on = 'NNAE_Global_Product__c', how='left').drop_duplicates()
+    PROD_FINAL_GLB['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    PROD_FINAL_DF = (PROD_FINAL_GLB[['Product_Id', 'Product_Name', 'OCE__ParentProduct__c', \
+    'Record_type', 'Par_Product_Name', 'Molecule', 'Segment', 'Brand', 'Speciality','NNAE_Global_Product__c','Global_Name','LAST_REFRESHED_DATE']])
+    uploadCSV('wh-product/wh-product.csv', PROD_FINAL_DF)
+    TA_DF = (PROD_DF[PROD_DF.Name.str.contains('Therapy')]\
+    .drop(['RecordTypeId', 'OCE__TherapeuticArea__c'], axis=1))
+    PARTA_DF = PROD_DF[['Id', 'Name']]
+    PARTA_DF.columns = ['Par_TA_Id', 'Par_TA_Name']
+    TA_FIN_DF = (pd.merge(pd.merge(TA_DF, PARTA_DF, left_on='OCE__ParentProduct__c', \
+    right_on='Par_TA_Id', how='left').drop(['Par_TA_Id'], axis=1), TA_GRP_DF, on='Name', \
+    how='left'))
+    TA_FIN_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    TA_FIN_DF = TA_FIN_DF[['Id', 'Name', 'OCE__ParentProduct__c', 'Par_TA_Name', 'TA_GROUP', 'LAST_REFRESHED_DATE']]
+    uploadCSV('wh-therapy-area/wh-therapy-area.csv', TA_FIN_DF)
+
+def wh_product_hierarchy():
+    """Function to create WH_PRODUCT_HIERARCHY TABLE"""
+    PROD_DF = csv_dataframe(PRDPATH, 'utf-8', PRD_COLS)
+    RECTYPE_DF = csv_dataframe(RECTYPEPATH, 'utf-8', RECTYPE_COLS)
+    RECTYPE_DF = RECTYPE_DF.rename({'Name':'Record_type', 'Id':'RecordTypeId'}, axis=1)
+    TPA_DF = csv_dataframe(TPAPATH, 'utf-8', TPA_COLS)
+    DIV_DF = csv_dataframe(DIV_PATH, 'utf-8', DIV_COLS)
+    DIV_DF = DIV_DF.rename({'Id':'Division', 'Name':'DIVISION_NAME'}, axis=1)
+    PRD_DF1 = (PROD_DF[['Id', 'Name', 'OCE__ParentProduct__c', 'RecordTypeId', \
+    'OCE__TherapeuticArea__c', 'OCE__DTP__c', 'Division']])
+    PRD_DF1 = PRD_DF1.rename({'Id':'Product_Id', 'Name':'Product_Name'}, axis=1)
+    TA_DF = (PROD_DF[PROD_DF.OCE__TherapeuticArea__c.isin(['Therapy Area NN'])]\
+    [['Id', 'Name']])
+    TA_DF.columns = ['TA_ID', 'Therapy_Area']
+    TPA_DF1 = TPA_DF.drop_duplicates().dropna()
+    TPA_DF1 = TPA_DF1.rename({'OCE__Product__c':'Product_Id'}, axis=1)
+    CHILD_DF = (pd.merge(pd.merge(PRD_DF1, RECTYPE_DF, on='RecordTypeId'), DIV_DF, on='Division', \
+    how='left').drop(['RecordTypeId', 'Division'], axis=1))
+    PAR_DF = CHILD_DF[['Product_Id', 'Product_Name']]
+    PAR_DF.columns = ['Par_Product_Id', 'Par_Product_Name']
+    PROD_FINAL = (pd.merge(CHILD_DF, PAR_DF, left_on='OCE__ParentProduct__c', \
+    right_on='Par_Product_Id', how='left').drop(['Par_Product_Id'], axis=1))
+    PROD_FINAL['TA_FLAG'] = 'No'
+    PROD_FINAL.loc[PROD_FINAL['OCE__TherapeuticArea__c'].isin(['Therapy Area NN']), 'TA_FLAG'] = 'Yes'
+    PROD_TH_DF = (pd.merge(pd.merge(PROD_FINAL, TA_PRD_DF, on='Product_Name', how='left'), \
+    TA_DF, on='Therapy_Area', how='left'))
+    PROD_TH_DF.loc[PROD_TH_DF['TA_FLAG']=='Yes', 'Therapy_Area'] = PROD_TH_DF['Product_Name']
+    PROD_TH_DF.loc[PROD_TH_DF['TA_FLAG']=='No', 'Therapy_Area'] = PROD_TH_DF['OCE__TherapeuticArea__c']
+    PROD_TH_DF.loc[PROD_TH_DF['TA_FLAG']=='Yes', 'TA_ID'] = PROD_TH_DF['Product_Id']
+    PROD_FIN_DF = pd.merge(PROD_TH_DF, TPA_DF1, on='Product_Id', how='left')
+    PROD_FIN_DF['Molecule'] = ''
+    PROD_FIN_DF['Segment'] = ''
+    PROD_FIN_DF['Brand'] = ''
+    PROD_FIN_DF['Speciality'] = ''
+    print("1")
+    PROD_FIN_DF['MONTH_ID'] = MONTHID
+    print("1")
+    PROD_FIN_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    PROD_FIN_DF = (PROD_FIN_DF[['Product_Id', 'Product_Name', 'OCE__ParentProduct__c', \
+    'Record_type', 'Par_Product_Name', 'Molecule', 'Segment', 'Brand', 'Speciality', \
+    'TA_FLAG', 'TA_ID', 'Therapy_Area', 'OCE__Territory__c', 'MONTH_ID', 'DIVISION_NAME', \
+    'OCE__DTP__c', 'LAST_REFRESHED_DATE']])
+    print("1")
+    uploadCSV('wh-product-hierarchy/wh-product-hierarchy-'+MONTHID+'.csv', PROD_FIN_DF)
+
+def wh_territory():
+    """Function to create WH_TERRITORY, WH_TERRITORY_D and WH_USERTERRITORY_H TABLES"""
+    TRT_DF = csv_dataframe(TRTPATH, 'utf-8', TRT_COLS)
+    TRT_DF = TRT_DF[~TRT_DF['Name'].isin(['Test DM', 'TestDMOK', 'Test MSL', 'TestSROK', 'Test Territory'])]
+    PROD_DF = csv_dataframe(PRDPATH, 'utf-8', PRD_COLS)
+    USRTRT_DF = csv_dataframe(USERTRTPATH, 'utf-8', USERTRT_COLS+['LastModifiedDate'])
+    USER_DF = csv_dataframe(USRPATH, 'utf-8', USR_COLS)
+    ATP_DF = csv_dataframe(ATPPATH, 'utf-8', ATP_COLS)
+    ACCTTRT_DF = csv_dataframe(ACCTTRTPATH, 'utf-8', ACCTTRT_COLS).drop('Id', axis=1)
+    TPA_DF = csv_dataframe(TPAPATH, 'utf-8', TPA_COLS)
+    PROF_DF = csv_dataframe(PROFPATH, 'utf-8', PROF_COLS)
+    PROF_DF.columns = ['ProfileId', 'ProfileName']
+    AFL_DF = AFF_DF[['AFFILIATE', 'REGION', 'BUSINESS_AREA']].drop_duplicates()
+    AFL_DF['AFFILIATE'] = AFL_DF['AFFILIATE'].str.upper()
+    THER_DF = PROD_DF[PROD_DF.OCE__TherapeuticArea__c.isin(['Therapy Area NN'])][['Id']]
+    THER_DF.columns = ['THERAPYAREA_ID']
+    PAR_USRTRT = USRTRT_DF[['UserId', 'Territory2Id']]
+    PAR_USRTRT.columns = ['Parent_Id', 'Par_TerritoryId']
+    PAR_DF = USER_DF[['Id', 'Alias']]
+    USR_DF = USER_DF[['Id', 'ProfileId', 'Alias']]
+    USR_DF.columns = ['User_Id', 'ProfileId', 'Login']
+    PAR_DF.columns = ['Parent_Id', 'Parent_Login']
+    ATP_DF2 = (ATP_DF[['OCE__Account__c', 'OCE__Product__c', 'NNEU_Core_TargetClass__c', \
+    'NNAE_Sub_Target__c', 'NNAE_Territory__c']].drop_duplicates())
+    ATP_DF2 = ATP_DF2.rename({'OCE__Product__c':'THERAPYAREA_ID', 'NNAE_Territory__c':'OCE__Territory__c'}, axis=1)
+    ATFDF = (ACCTTRT_DF[~ACCTTRT_DF['OCE__Territory__c'].isin(['AU'])]\
+    [['OCE__Territory__c', 'OCE__Account__c', 'IsDeleted']].drop_duplicates())
+    ATP_TRT = list(ATP_DF2[~ATP_DF2['OCE__Territory__c'].isna()]['OCE__Territory__c'].drop_duplicates())
+    TPA_FINAL = (pd.merge(TPA_DF, THER_DF, left_on='OCE__Product__c', right_on='THERAPYAREA_ID')\
+    .drop(['OCE__Product__c'], axis=1))
+    ATP_FINAL = (pd.merge(TPA_DF, THER_DF, left_on='OCE__Product__c', right_on='THERAPYAREA_ID')\
+    .drop(['OCE__Product__c'], axis=1))
+    TRT_DF1 = (TRT_DF[['Id', 'Name', 'MirrorTerritory__c', \
+    'UserNameOfMirrorTerritory__c', 'ParentTerritory2Id', 'SystemModstamp', \
+    'NN_Core_PositionType__c', 'NNAE_Organization__c']])
+    TRT_DF1['NNAE_Organization__c'] = TRT_DF1['NNAE_Organization__c'].str.upper()
+    INITIAL_DF = (pd.merge(TRT_DF1, USRTRT_DF, left_on='Id', right_on='Territory2Id', how='left')\
+    .drop(['Territory2Id'], axis=1))
+    INITIAL_DF = (pd.merge(INITIAL_DF, PAR_USRTRT, left_on='ParentTerritory2Id', \
+    right_on='Par_TerritoryId', how='left').drop(['Par_TerritoryId'], axis=1))
+    INITIAL_DF = (pd.merge(INITIAL_DF, ATFDF[['OCE__Territory__c','OCE__Account__c',\
+    'IsDeleted']], left_on='Name', right_on='OCE__Territory__c', how='left')\
+    .drop(['OCE__Territory__c'], axis=1))
+    INITIAL_DF = (pd.merge(pd.merge(INITIAL_DF, USR_DF, left_on='UserId', right_on='User_Id', \
+    how='left').drop(['User_Id'], axis=1), PAR_DF, left_on='Parent_Id', right_on='Parent_Id', \
+    how='left'))
+    TER_FINAL = (pd.merge(INITIAL_DF, PROF_DF, left_on='ProfileId', right_on='ProfileId', \
+    how='left').drop(['ProfileId'], axis=1))
+    TER_FINAL['CREATED_MONTH_ID'] = (pd.to_datetime(TER_FINAL['SystemModstamp']).\
+    apply(lambda x: x.strftime('%m%Y')))
+    TER_TPA_DF = (pd.merge(TER_FINAL, TPA_FINAL, left_on='Name', \
+    right_on='OCE__Territory__c', how='left'))
+    TER_WITH_ATP = (pd.merge(TER_TPA_DF[TER_TPA_DF['OCE__Territory__c'].isin(ATP_TRT)], \
+    ATP_DF2, on=['OCE__Account__c', 'THERAPYAREA_ID', 'OCE__Territory__c'], how='left'))
+    TER_WO_ATP = (pd.merge(TER_TPA_DF[~TER_TPA_DF['OCE__Territory__c'].isin(ATP_TRT)], \
+    ATP_DF2.drop('OCE__Territory__c', axis=1), on=['OCE__Account__c', 'THERAPYAREA_ID'], \
+    how='left'))
+    TER_FINAL_DF = (pd.concat([TER_WITH_ATP,TER_WO_ATP], ignore_index=True)\
+    .drop_duplicates().fillna(''))
+    TER_FINAL_DF.loc[(TER_FINAL_DF['NNEU_Core_TargetClass__c']!='')&(TER_FINAL_DF['NNAE_Sub_Target__c']=='')&(TER_FINAL_DF['OCE__Territory__c'].str.contains('TU')), 'NNAE_Sub_Target__c'] = 'T'
+    TER_FINAL_DF['TARGETCLASS_ID'] = (TER_FINAL_DF.apply(lambda x: '' \
+    if x['NNEU_Core_TargetClass__c']=='' \
+    else x['NNEU_Core_TargetClass__c']+'-0'+x['NNAE_Sub_Target__c'], axis=1))
+    TER_FINAL_DF = (pd.merge(TER_FINAL_DF, AFL_DF, left_on='NNAE_Organization__c', \
+    right_on='AFFILIATE', how='left'))
+    TER_FINAL_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    TER_FIN_DF = (TER_FINAL_DF[['Id', 'Name', 'MirrorTerritory__c', \
+    'UserNameOfMirrorTerritory__c', 'ParentTerritory2Id', 'UserId', 'Login', 'IsDeleted', \
+    'OCE__Account__c', 'NNAE_Organization__c', 'ProfileName', 'NN_Core_PositionType__c', \
+    'Parent_Id', 'Parent_Login', 'CREATED_MONTH_ID', 'THERAPYAREA_ID', 'TARGETCLASS_ID', \
+    'REGION', 'BUSINESS_AREA', 'LAST_REFRESHED_DATE']].drop_duplicates())
+    uploadCSV('wh-territory/wh-territory.csv', TER_FIN_DF)
+    TR_D_FIN_DF = (TER_FINAL_DF[['Name', 'UserId', 'NNAE_Organization__c', 'ProfileName', 'Id', \
+    'ParentTerritory2Id', 'Login', 'REGION', 'BUSINESS_AREA', 'LastModifiedDate']]\
+    .drop_duplicates())
+    TR_D_FIN_DF['IS_VACANT'] = (TR_D_FIN_DF.apply(lambda row: 1 if row.UserId=='' else 0, \
+    axis=1))
+    TR_D_FIN_DF['MONTH_ID'] = MONTHID
+    TR_D_FIN_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    TR_D_FIN_DF = (TR_D_FIN_DF[['Name', 'UserId', 'NNAE_Organization__c', 'ProfileName', \
+    'IS_VACANT', 'MONTH_ID', 'Id', 'ParentTerritory2Id', 'Login', 'REGION', 'BUSINESS_AREA', \
+    'LastModifiedDate', 'LAST_REFRESHED_DATE']])
+    uploadCSV('wh-territory-d/wh-territory-d-'+MONTHID+'.csv', TR_D_FIN_DF)
+    TRT_USR = USER_DF[['Id', 'Alias', 'ProfileId', 'IsActive', 'EmployeeNumber', 'Country']]
+    TRT_USR['Alias'] = (TRT_USR.apply(lambda x: x.EmployeeNumber \
+    if x.Country == 'South Korea' else x.Alias, axis=1))
+    #TRT_USR.loc[TRT_USR['Country'] == 'South Korea', 'Alias'] = TRT_USR.loc[TRT_USR['Country'] == 'South Korea', 'EmployeeNumber']
+    Trt_child_df = TRT_DF[['Id', 'Name']]
+    Trt_child_df.columns = ['CHILD_ID', 'CHILD_TERRITORY']
+    Trt_Hierarchy_df = TRT_DF[['Id', 'ParentTerritory2Id']]
+    TRT_AFF_DF = (pd.merge(TRT_DF[['Id', 'Name', 'ParentTerritory2Id', 'NN_Core_PositionType__c', \
+    'NNAE_Organization__c']], AFF_DF, left_on='NNAE_Organization__c', right_on='AFFILIATE')\
+    .drop(['AFFILIATE'], axis=1))
+    
+    new_df = pd.DataFrame(columns=['parent_id', 'list_of_children'])
+    for index, row in Trt_Hierarchy_df.iterrows():
+        temp_df = pd.DataFrame(columns=['parent_id', 'list_of_children'])
+        temp_df['list_of_children'] = (pd.Series(get_child_list(Trt_Hierarchy_df, \
+        row['ParentTerritory2Id'])))
+        #row['ParentTerritory2Id']),dtype='object'))
+        temp_df['parent_id'] = row['ParentTerritory2Id']
+        new_df = new_df.append(temp_df)
+    
+    TRT_HIER_DF = (pd.merge(pd.merge(new_df, TRT_DF[['Id', 'Name']], left_on='parent_id', \
+    right_on='Id').drop(['parent_id'], axis=1), Trt_child_df, left_on='list_of_children', \
+    right_on='CHILD_ID').drop(['CHILD_ID', 'list_of_children'], axis=1))
+    TRT_HIER_DF = (TRT_HIER_DF.groupby(['Id', 'Name'], as_index=False)\
+    .agg({'CHILD_TERRITORY': ','.join}))
+    TRT_FINAL_DF = (pd.merge(TRT_AFF_DF[['Id', 'Name', 'NN_Core_PositionType__c', 'LANGUAGE', \
+    'NNAE_Organization__c']], TRT_HIER_DF, left_on=['Id', 'Name'], right_on=['Id', 'Name'], \
+    how='left'))
+    TRT_FINAL_DF['CHILD_TERRITORY'] = (TRT_FINAL_DF.apply(lambda row: row.Name if \
+    row.CHILD_TERRITORY is np.nan else row['Name']+','+row['CHILD_TERRITORY'], axis=1))
+    USRTRT_FINAL = (pd.merge(USRTRT_DF[['UserId', 'Territory2Id']], TRT_FINAL_DF, \
+    left_on=['Territory2Id'], right_on=['Id']).drop(['Id'], axis=1))
+    USR_FINAL = (pd.merge(TRT_USR, USRTRT_FINAL, left_on=['Id'], right_on=['UserId'])\
+    .drop(['Id'], axis=1))
+    USR_FINAL.loc[USR_FINAL['Alias']=='RFB', 'LANGUAGE'] = 'ENGLISH'
+    UT_FIN_DF = (pd.merge(USR_FINAL, PROF_DF, left_on='ProfileId', right_on='ProfileId', \
+    how='left').drop(['ProfileId'], axis=1))
+    UT_FIN_DF[UT_FIN_DF['Name'].str.contains('KR')]
+    UT_FIN_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    UT_FIN_DF = (UT_FIN_DF[['Alias', 'IsActive', 'UserId', 'Name', 'CHILD_TERRITORY', \
+    'ProfileName', 'NN_Core_PositionType__c', 'LANGUAGE', 'NNAE_Organization__c', 'LAST_REFRESHED_DATE']]\
+    .drop_duplicates())
+    uploadCSV('wh-userterritory-h/wh-userterritory-h.csv', UT_FIN_DF)
+
+def wh_user():
+    """Function to create WH_USER TABLE"""
+    USER_DF = csv_dataframe(USRPATH, 'utf-8', USR_COLS)
+    PROF_DF = csv_dataframe(PROFPATH, 'utf-8', PROF_COLS)
+    PROF_DF.columns = ['ProfileId', 'ProfileName']
+    FSM_DF = USER_DF[['Id', 'Name']]
+    FSM_DF.columns = ['FSM_Id', 'FSM_Name']
+    USER_PAR_DF = (pd.merge(USER_DF, FSM_DF, left_on='ManagerId', right_on='FSM_Id', how='left')\
+    .drop(['ManagerId'], axis=1))
+    USR_PROF_DF = pd.merge(USER_PAR_DF, PROF_DF, on='ProfileId', how='left')
+    USR_FIN_DF = pd.merge(USR_PROF_DF, UP_AREA_DF, on='ProfileName', how='left')
+    USR_FIN_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    USR_FIN_DF = (USR_FIN_DF[['Alias', 'City', 'CompanyName', 'Country', 'Department', \
+    'Division', 'Email', 'FirstName', 'Id', 'IsActive', 'LastName', 'Latitude', 'Longitude', \
+    'Name', 'OCE__IsLoggingEnabled__c', 'PostalCode', 'ProfileId', 'State', 'Street', 'Title', \
+    'Username', 'FSM_Id', 'FSM_Name', 'ProfileName', 'Persona', 'LAST_REFRESHED_DATE','LastModifiedDate']])
+    uploadCSV('wh-user/wh-user.csv', USR_FIN_DF)
+
+def wh_target_class():
+    """Function to create WH_TARGET_CLASS TABLE"""
+    OCP_TC_DF = OCP_CP_DF[OCP_TC_COLS].drop_duplicates()
+    OCP_TC_DF = OCP_TC_DF.fillna('T')
+    ATP_DF = csv_dataframe(ATPPATH, 'utf-8', ['NNEU_Core_TargetClass__c', 'NNAE_Sub_Target__c'])
+    ATP_TC_DF = ATP_DF.dropna().drop_duplicates()
+    ATP_TC_DF.columns = ['Target Class', 'Sub Target Class']
+    OCP_TC_DF['Sub Target Class'] = (OCP_TC_DF['Sub Target Class'].astype('str').str\
+    .replace('.0', ''))
+    TC_FULL_DF = pd.concat([OCP_TC_DF,ATP_TC_DF], ignore_index=True).drop_duplicates()
+    TC_FULL_DF['ROW_ID'] = TC_FULL_DF['Target Class']+'-0'+TC_FULL_DF['Sub Target Class']
+    TC_FULL_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    TC_FULL_DF = TC_FULL_DF[['ROW_ID', 'Target Class', 'Sub Target Class', 'LAST_REFRESHED_DATE']].drop_duplicates()
+    uploadCSV('wh-target-class/wh-target-class.csv', TC_FULL_DF)
+
+def wh_coaching():
+    """Function to create WH_COACHING TABLE"""
+    USER_DF = csv_dataframe(USRPATH, 'utf-8', ['Id', 'TimeZoneSidKey', 'LanguageLocaleKey'])
+    USER_DF.columns = ['OCE__OfflineCreatedByID__c', 'TIME_ZONE', 'Language_code']
+    FC_DF = csv_dataframe(FCPATH, 'utf-8', FC_COLS)
+    FC_DF['OCE__OfflineCreatedByID__c'] = (FC_DF['OCE__OfflineCreatedByID__c']\
+    .fillna(FC_DF['CreatedById']))
+    FCD_DF = csv_dataframe(FC_DATA_PATH, 'utf-8', FCD_COLS+['OCE__FormQuestion__c'])
+    FCFQ_DF = csv_dataframe(FCFQ_DATA_PATH, 'utf-8', ['Id', 'OCE__Question__c'])
+    FCFQ_DF = FCFQ_DF.rename({'Id':'FCFQ_Id','OCE__Question__c':'FCFQ_OCE__Question__c'}, axis=1)
+    FCQ_DF = csv_dataframe(FCQ_DATA_PATH, 'utf-8', ['Id', 'Name'])
+    FCQ_DF = FCQ_DF.rename({'Id':'FCQ_Id','Name':'FCQ_Name'}, axis=1)
+    FCD_TEMP_DF = (pd.merge(pd.merge(FCD_DF,FCFQ_DF, left_on = 'OCE__FormQuestion__c' , right_on='FCFQ_Id' , how = 'left'), \
+    FCQ_DF, left_on ='FCFQ_OCE__Question__c' ,right_on = 'FCQ_Id' , how = 'left').drop(['FCFQ_Id','FCFQ_OCE__Question__c','FCQ_Id','OCE__FormQuestion__c'], axis=1))
+    FC_DF['MONTH_ID'] = (pd.to_datetime(FC_DF['OCE__StartDate__c'])\
+    .apply(lambda x: x.strftime('%m%Y')))
+    FC_TRT_DF = pd.merge(FC_DF, TRT_HIST_DF, on=['OCE__User__c', 'MONTH_ID'], how='left')
+    FC_FIN_DF = (pd.merge(pd.merge(pd.merge(FC_TRT_DF, FCD_TEMP_DF, left_on='Id', \
+    right_on='OCE__FieldCoachingEvent__c', how='left').drop(['OCE__FieldCoachingEvent__c'], \
+    axis=1), USER_DF, on='OCE__OfflineCreatedByID__c'), LOC_LAN_DF, left_on=['OCE__Status__c', \
+    'Language_code'], right_on=['Value', 'Language_code'], how='left'))
+    FC_FIN_DF['Translation'] = FC_FIN_DF['Translation'].fillna(FC_FIN_DF['OCE__Status__c'])
+    FC_FIN_DF['OCE__StartDate__c'] = pd.to_datetime(FC_FIN_DF['OCE__StartDate__c'])
+    FC_FIN_DF['OCE__EndDate__c'] = pd.to_datetime(FC_FIN_DF['OCE__EndDate__c'])
+    FC_FIN_DF['CreatedDate'] = pd.to_datetime(FC_FIN_DF['CreatedDate'])
+    FC_FIN_DF['OCE__StartDate__c'] =  (FC_FIN_DF.groupby('TIME_ZONE')['OCE__StartDate__c']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    FC_FIN_DF['OCE__EndDate__c'] =  (FC_FIN_DF.groupby('TIME_ZONE')['OCE__EndDate__c']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    FC_FIN_DF['CreatedDate'] =  (FC_FIN_DF.groupby('TIME_ZONE')['CreatedDate']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    FC_FIN_DF['NO_OF_COACHING_DAYS'] = (FC_FIN_DF.apply(lambda x: 0 \
+    if (pd.isnull(x['OCE__StartDate__c']) or pd.isnull(x['OCE__EndDate__c'])) \
+    else np.busday_count(pd.to_datetime(x.OCE__StartDate__c).date(), \
+    pd.to_datetime(x.OCE__EndDate__c).date())+1, axis=1))
+    FC_FIN_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    FC_FIN_DF = (FC_FIN_DF[['Id', 'OwnerId', 'OCE__User__c', 'Translation', 'CreatedDate', \
+    'OCE__StartDate__c', 'OCE__EndDate__c', 'OCE__FinishedDate__c', 'OCE__AcknowledgedDate__c', \
+    'OCE__NumberOfCoachingCalls__c', 'OCE__TemplateName__c', 'OCE__Category__c', \
+    'OCE__Question__c', 'OCE__CoachScore__c', 'MONTH_ID', 'NO_OF_COACHING_DAYS', 'TERRITORY', \
+    'OCE__EmployeeCommentsLong__c', 'OCE__ManagersCommentsLong__c', 'OCE__Status__c', \
+    'OCE__SelfEvaluationScore__c', 'LAST_REFRESHED_DATE','NNAE_Duration__c','NNAE_Note__c', \
+    'FCQ_Name','CreatedById','NNAE_Action_Plan__c','NNAE_Action_Date__c']].drop_duplicates())
+    uploadCSV('wh-field-coaching/wh-field-coaching.csv', FC_FIN_DF)
+
+def wh_acc_adoption_ladder_m():
+    """Function to create WH_ACC_ADOPTION_LADDER_M TABLE"""
+    LOC_ADL_DF = (LOC_LAN_DF[LOC_LAN_DF['Object'].isin(['OCE__AccountTerritoryProduct__c'])\
+    &LOC_LAN_DF['Field'].isin(['NNEU_Core_AdoptionLadder__c'])][['Value', 'Language_code', 'Translation']])
+    LOC_ADL_DF.columns = ['NNEU_Core_AdoptionLadder__c', 'Language_code', 'ADL_TRANSLATION']
+    LOC_SA_DF = (LOC_LAN_DF[LOC_LAN_DF['Object'].isin(['OCE__AccountTerritoryProduct__c'])\
+    &LOC_LAN_DF['Field'].isin(['NNEU_Core_ScientificAwareness__c'])][['Value', 'Language_code', 'Translation']])
+    LOC_SA_DF.columns = ['NNEU_Core_ScientificAwareness__c', 'Language_code', 'SA_TRANSLATION']
+    LOC_CE_DF = (LOC_LAN_DF[LOC_LAN_DF['Object'].isin(['OCE__AccountTerritoryProduct__c'])\
+    &LOC_LAN_DF['Field'].isin(['NNAE_Clinical_Experience__c'])][['Value', 'Language_code', 'Translation']])
+    LOC_CE_DF.columns = ['NNAE_Clinical_Experience__c', 'Language_code', 'CE_TRANSLATION']
+    LOC_ADV_DF = (LOC_LAN_DF[LOC_LAN_DF['Object'].isin(['OCE__AccountTerritoryProduct__c'])\
+    &LOC_LAN_DF['Field'].isin(['NNAE_Scientific_Advocacy__c'])][['Value', 'Language_code', 'Translation']])
+    LOC_ADV_DF.columns = ['NNAE_Scientific_Advocacy__c', 'Language_code', 'ADV_TRANSLATION']
+    
+    PR_OBJ = S3.get_object(Bucket=WH_BUCKET, Key='ioengage/data/aameo/prod/csv/wh-product-hierarchy/wh-product-hierarchy-{}.csv'.format(MONTHID))
+    PR_STRING = PR_OBJ['Body'].read().decode('utf-8')
+    PR_DF = (pd.read_csv(io.StringIO(PR_STRING), quotechar='"', sep=',', on_bad_lines='skip', \
+    usecols=['Product_Id', 'TA_ID'], dtype=str).drop_duplicates())
+    PR_DF = PR_DF.rename({'Product_Id':'OCE__Product__c', 'TA_ID':'Therapy_Area_ID'}, axis=1)
+    
+    ACCNT_DF = (csv_dataframe(ACCNTPATH, 'utf-8', ['Id', 'NNEU_Core_InfluenceLevelTier__c', \
+    'NNAE_Language__c','NNEU_Core_InvestorExperience__c','NNAE_NNInvestExpformula__c']))
+    ACCNT_DF = ACCNT_DF.rename({'Id':'OCE__Account__c', 'NNAE_Language__c':'Language_code'}, axis=1)
+    ATP_DF = csv_dataframe(ATPPATH, 'utf-8', ATP_COLS+['LastModifiedById'])
+    ATP_DF[['NNEU_Core_TargetClass__c','NNAE_Sub_Target__c', 'NNAE_Territory__c']] = ATP_DF[['NNEU_Core_TargetClass__c','NNAE_Sub_Target__c', 'NNAE_Territory__c']].fillna('')
+    ATP_DF.loc[(ATP_DF['NNEU_Core_TargetClass__c']!='')&(ATP_DF['NNAE_Sub_Target__c']=='')&(ATP_DF['NNAE_Territory__c'].str.contains('TU')), 'NNAE_Sub_Target__c'] = 'T'
+    ATP_INIT_DF = ATP_DF.drop(['NNEU_Core_TargetClass__c', 'NNAE_Sub_Target__c'], axis=1)
+    ATP_TC_DF = (ATP_DF[['OCE__Account__c', 'OCE__Product__c', 'NNEU_Core_TargetClass__c', \
+    'NNAE_Sub_Target__c']])
+    ATP_TC_DF = ATP_TC_DF.rename({'OCE__Product__c':'Therapy_Area_ID'}, axis=1)
+    AL_FINAL_DF = (pd.merge(pd.merge(ATP_INIT_DF, ACCNT_DF, on='OCE__Account__c'), \
+    PR_DF, on='OCE__Product__c', how='left'))
+    AL_FINAL_DF['Therapy_Area_ID'] = (AL_FINAL_DF['Therapy_Area_ID']\
+    .fillna(AL_FINAL_DF['OCE__Product__c']))
+    
+    AL_FIN_DF  = pd.merge(AL_FINAL_DF, ATP_TC_DF, on=['OCE__Account__c', 'Therapy_Area_ID'], how='left')
+    AL_FIN_DF['MONTH_ID'] = MONTHID
+    AL_FIN_DF['TARGETCLASS_ID'] = (AL_FIN_DF['NNEU_Core_TargetClass__c']+'-0'+\
+    AL_FIN_DF['NNAE_Sub_Target__c'])
+    AL_FIN_DF = (pd.merge(pd.merge(pd.merge(pd.merge(AL_FIN_DF, LOC_ADL_DF, \
+    on=['NNEU_Core_AdoptionLadder__c', 'Language_code'], how='left'), LOC_SA_DF, \
+    on=['NNEU_Core_ScientificAwareness__c', 'Language_code'], how='left'), LOC_CE_DF, \
+    on=['NNAE_Clinical_Experience__c', 'Language_code'], how='left'), LOC_ADV_DF, \
+    on=['NNAE_Scientific_Advocacy__c', 'Language_code'], how='left'))
+    AL_FIN_DF['ADL_TRANSLATION'] = (AL_FIN_DF['ADL_TRANSLATION']\
+    .fillna(AL_FIN_DF['NNEU_Core_AdoptionLadder__c']))
+    AL_FIN_DF['SA_TRANSLATION'] = (AL_FIN_DF['SA_TRANSLATION']\
+    .fillna(AL_FIN_DF['NNEU_Core_ScientificAwareness__c']))
+    AL_FIN_DF['CE_TRANSLATION'] = (AL_FIN_DF['CE_TRANSLATION']\
+    .fillna(AL_FIN_DF['NNAE_Clinical_Experience__c']))
+    AL_FIN_DF['ADV_TRANSLATION'] = (AL_FIN_DF['ADV_TRANSLATION']\
+    .fillna(AL_FIN_DF['NNAE_Scientific_Advocacy__c']))
+    AL_FIN_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    AL_FIN_DF = (AL_FIN_DF[['OCE__Account__c', 'OCE__Product__c', 'ADL_TRANSLATION', \
+    'NNEU_Core_ProductSpeakerTrained__c', 'TARGETCLASS_ID', 'NNEU_Core_ScientificAwareness__c', \
+    'NNEU_Core_InfluenceLevelTier__c', 'MONTH_ID', 'LastModifiedDate', 'NNAE_Territory__c', \
+    'NNAE_Clinical_Experience__c', 'NNAE_Scientific_Advocacy__c', 'NNEU_Core_AdoptionLadder__c', \
+    'Therapy_Area_ID', 'SA_TRANSLATION', 'CE_TRANSLATION', 'ADV_TRANSLATION', 'LAST_REFRESHED_DATE',\
+    'NNEU_Core_InvestorExperience__c','NNAE_NNInvestExpformula__c','NNAE_NN_Investigator__c','LastModifiedById']].drop_duplicates())
+    uploadCSV('wh-adoption-ladder/wh-adoption-ladder-'+MONTHID+'.csv', AL_FIN_DF)
+
+
+def wh_survey():
+    """Function to create wh_survey TABLE"""
+    USER_DF = csv_dataframe(USRPATH, 'utf-8', ['Id', 'TimeZoneSidKey'])
+    USER_DF.columns = ['OwnerId', 'TIME_ZONE']
+    TRT_DF = csv_dataframe(TRTPATH, 'utf-8', ['Id', 'Name'])
+    TRT_DF.columns = ['Id','Territory']
+    USRTRT_DF = csv_dataframe(USERTRTPATH, 'utf-8', ['UserId', 'Territory2Id'])
+    SVR_DF = (spark.read.option("header", True).option("delimiter","\t").format("csv")\
+    .load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__SURVEYRESPONSE__C/*.csv"\
+    .format(env)).select(SVR_COLS))
+    SVR_DF = SVR_DF.toPandas()
+    SVR_DF = SVR_DF.rename({'Id':'OCE__SurveyResponse__c', 'Name':'SURVEY_NAME'}, axis=1)
+    SVQR_DF = (spark.read.option("header", True).option("delimiter","\t").format("csv")\
+    .load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__SURVEYQUESTIONRESPONSE__C/*.csv"\
+    .format(env)).select(SVQR_COLS))
+    SVQR_DF = SVQR_DF.toPandas()
+    SVQR_DF['OCE__ResponseText__c'] = SVQR_DF['OCE__ResponseText__c'].fillna(SVQR_DF['OCE__Response__c'])
+    SV_DF = csv_dataframe(SV_PATH, 'utf-8', SV_COLS)
+    CALLDLG_DF = spark.read.option("header", True).option("delimiter","\t").format("csv").load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__CALLDIALOGUE__C/*.csv".format(env)).select(CALLDLG_COLS)
+    CALLDLG_DF = CALLDLG_DF.withColumnRenamed("Id","OCE__CallDialogue__c")
+    CD_DF = spark.read.option("header", True).option("delimiter","\t").format("csv").load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__CALLDETAIL__C/*.csv".format(env)).select(['Id', 'OCE__Account__c','OCE__Call__c'])
+    CD_DF = (CD_DF.withColumnRenamed("Id","CallDetail_Id")\
+    .withColumnRenamed('OCE__Account__c', 'PRD_ACCOUNT'))
+    CALLDLG_CD = CALLDLG_DF.join(CD_DF,(CALLDLG_DF.OCE__CallDetail__c == CD_DF.CallDetail_Id),"left").dropDuplicates()
+    CALLDLG_CD = CALLDLG_CD.toPandas()
+    CALLDLG_CD = CALLDLG_CD.drop('CallDetail_Id', axis=1)
+    print(CALLDLG_CD.columns)
+    CALL_DF = spark.read.option("header", True).option("delimiter","\t").format("csv").load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__CALL__C/*.csv".format(env)).select(['Id', 'OCE__Account__c'])
+    CALL_DF =CALL_DF.toPandas()
+    CALL_DF = CALL_DF.rename({'Id':'OCE__Call__c','OCE__Account__c':'CL_ACCOUNT'}, axis=1)
+
+    URT_DF = (pd.merge(USRTRT_DF, TRT_DF, left_on='Territory2Id', \
+    right_on='Id').drop(['Territory2Id','Id'], axis=1))
+    SVR_DF['MONTH_ID'] = pd.to_datetime(SVR_DF['CreatedDate']).apply(lambda x: x.strftime('%m%Y'))
+    # Splitting the DataFrame based on submission date
+    nrx_df_1 = SVR_DF[SVR_DF['LastModifiedDate'] < "2024-09-15"].drop(['OCE__Call__c'], axis =1)
+    nrx_df_2 = SVR_DF[SVR_DF['LastModifiedDate'] >= "2024-09-15"]
+    # process 1 Call_1.0print(CALLDLG_CD.columns())
+    SURVEY_DF = (pd.merge(pd.merge(nrx_df_1, SVQR_DF.fillna(''), on='OCE__SurveyResponse__c', \
+    how='left'), CALLDLG_CD, on=['OCE__CallDialogue__c', 'OCE__SurveyInvitation__c'], how='left'))
+    print(SURVEY_DF.columns)
+    SURVEY_DF.loc[SURVEY_DF['OCE__Type__c']=='Product', 'OCE__Account__c'] = SURVEY_DF['PRD_ACCOUNT']
+    SURVEY_FINAL = (pd.merge(SURVEY_DF, SV_DF, left_on='OCE__Survey__c', \
+    right_on='Id', how='left').drop(['Id','OCE__Survey__c'], axis=1))
+    SURVEY_FINAL = (pd.merge(SURVEY_FINAL, URT_DF, left_on='OwnerId', \
+    right_on='UserId', how='left').drop(['UserId'], axis=1))
+    SURVEY_FIN_DF1 = pd.merge(SURVEY_FINAL, USER_DF, on='OwnerId', how='left')
+    SURVEY_FIN_DF1[['CreatedDate', 'OCE__Completion__c']] = (SURVEY_FIN_DF1[['CreatedDate', \
+    'OCE__Completion__c']].apply(pd.to_datetime))
+    SURVEY_FIN_DF1['TIME_ZONE'] = SURVEY_FIN_DF1['TIME_ZONE'].fillna('UTC')
+    SURVEY_FIN_DF1['CreatedDate'] =  (SURVEY_FIN_DF1.groupby('TIME_ZONE')['CreatedDate']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    SURVEY_FIN_DF1['OCE__Completion__c'] =  (SURVEY_FIN_DF1.groupby('TIME_ZONE')['OCE__Completion__c']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    SURVEY_FIN_DF1['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    print("1")
+    SURVEY_FIN_DF1 = (SURVEY_FIN_DF1[['OwnerId', 'CreatedDate', 'OCE__QuestionText__c', \
+    'OCE__ResponseText__c', 'Name', 'OCE__Account__c', 'Territory', 'MONTH_ID', 'OCE__Status__c', \
+    'OCE__Completion__c', 'OCE__SurveyResponse__c', 'OCE__Type__c', 'SURVEY_NAME', 'LAST_REFRESHED_DATE','OCE__Call__c']]\
+    .drop_duplicates())
+    print("1")
+    # process 2 Call_2.0
+    SURVEY_DF = (pd.merge(pd.merge(nrx_df_2, SVQR_DF.fillna(''), on='OCE__SurveyResponse__c', \
+    how='left'), CALL_DF, on= 'OCE__Call__c', how='left'))
+    SURVEY_DF.loc[SURVEY_DF['OCE__Type__c']=='Product', 'OCE__Account__c'] = SURVEY_DF['CL_ACCOUNT']
+
+    SURVEY_FINAL = (pd.merge(SURVEY_DF, SV_DF, left_on='OCE__Survey__c', \
+    right_on='Id', how='left').drop(['Id','OCE__Survey__c'], axis=1))
+    SURVEY_FINAL = (pd.merge(SURVEY_FINAL, URT_DF, left_on='OwnerId', \
+    right_on='UserId', how='left').drop(['UserId'], axis=1))
+    SURVEY_FIN_DF2 = pd.merge(SURVEY_FINAL, USER_DF, on='OwnerId', how='left')
+    SURVEY_FIN_DF2[['CreatedDate', 'OCE__Completion__c']] = (SURVEY_FIN_DF2[['CreatedDate', \
+    'OCE__Completion__c']].apply(pd.to_datetime))
+    SURVEY_FIN_DF2['TIME_ZONE'] = SURVEY_FIN_DF2['TIME_ZONE'].fillna('UTC')
+    SURVEY_FIN_DF2['CreatedDate'] =  (SURVEY_FIN_DF2.groupby('TIME_ZONE')['CreatedDate']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    SURVEY_FIN_DF2['OCE__Completion__c'] =  (SURVEY_FIN_DF2.groupby('TIME_ZONE')['OCE__Completion__c']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    SURVEY_FIN_DF2['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    print("1")
+    SURVEY_FIN_DF2 = (SURVEY_FIN_DF2[['OwnerId', 'CreatedDate', 'OCE__QuestionText__c', \
+    'OCE__ResponseText__c', 'Name', 'OCE__Account__c', 'Territory', 'MONTH_ID', 'OCE__Status__c', \
+    'OCE__Completion__c', 'OCE__SurveyResponse__c', 'OCE__Type__c', 'SURVEY_NAME', 'LAST_REFRESHED_DATE','OCE__Call__c']]\
+    .drop_duplicates())
+    print("1")
+    SURVEY_FIN_DF = pd.concat([SURVEY_FIN_DF1, SURVEY_FIN_DF2], axis=0)
+    uploadCSV('wh-survey/wh-survey.csv', SURVEY_FIN_DF)
+
+    
+def wh_mccp():
+    MCQ_TEMP = MCQ_DF[MCQ_COLS].drop_duplicates()
+    MCQ_TEMP['Month_Id'] = (pd.to_datetime(MCQ_TEMP['Month_Id'])\
+    .apply(lambda x: x.strftime('%m%Y')))
+    MCQ_FINAL = MCQ_TEMP.fillna('')
+    MCQ_FINAL['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    MCQ_FIN_DF = MCQ_FINAL[['Affiliate','Channel','Status','Month_Id','Contact','MCQs','LAST_REFRESHED_DATE']]
+    uploadCSV('wh-mccp/wh-mccp.csv', MCQ_FIN_DF)
+
+def wh_medical_activity():
+    PER_DF = (csv_dataframe(PERPATH, 'utf-8', ['Id', 'OCE__StartDate__c', 'OCE__EndDate__c'])\
+    .loc[lambda df: (df['OCE__StartDate__c'].str.contains(YEAR)|df['OCE__StartDate__c'].str.contains(str(PREV_YEAR))), :])
+    print(PER_DF.shape)
+    AP_DF = csv_dataframe(APPATH, 'utf-8', ['Id','OCE__AccountGoal__c'])
+    AG_DF = csv_dataframe(AGPATH, 'utf-8', ['OCE__Account__c', 'OCE__PlanCycle__c', 'Id'])
+    PC_DF = (csv_dataframe(PCPATH, 'utf-8', ['Id','OCE__Territory__c','OCE__Period__c'])\
+             .loc[lambda df: df['OCE__Territory__c'].str.contains('ME'),:])
+
+    PER_DF.columns = ['PERIOD_ID', 'PERIOD_START_DT', 'PERIOD_END_DT']
+    AP_DF.columns = (['ACTIVITY_PLAN_ID','ACCOUNT_GOAL_ID'])
+    AG_DF.columns = ['ACCOUNT_ID', 'PLAN_CYCLE_ID', 'ACCOUNT_GOAL_ID']
+    PC_DF.columns = ['PLAN_CYCLE_ID','TERRITORY', 'PERIOD_ID']
+    #PC_DF = PC_DF[PC_DF['TERRITORY'].apply(lambda x: x[1:3] == 'ME')]
+
+    PER_DF1 = pd.concat([pd.Series(r.PERIOD_ID,pd.date_range(r.PERIOD_START_DT, r.PERIOD_END_DT, freq='MS')) 
+                     for r in PER_DF.itertuples()]).reset_index()
+    PER_DF1.columns = ['PERIOD_START_DT','PERIOD_ID']
+
+    PC_PER_DF = pd.merge(PC_DF, PER_DF1, left_on='PERIOD_ID', right_on='PERIOD_ID')
+    AG_PC_PER_DF = (pd.merge(AG_DF, PC_PER_DF, left_on='PLAN_CYCLE_ID', right_on='PLAN_CYCLE_ID')\
+    .drop(['PLAN_CYCLE_ID'], axis=1))
+
+    AP_INT_DF = (pd.merge(AP_DF, AG_PC_PER_DF, left_on='ACCOUNT_GOAL_ID', \
+    right_on='ACCOUNT_GOAL_ID').drop(['ACCOUNT_GOAL_ID'], axis=1))
+  
+    AP_INT_DF['MONTH_ID'] = (pd.to_datetime(AP_INT_DF['PERIOD_START_DT'])\
+    .apply(lambda x: x.strftime('%m%Y')))
+
+    AP_INT_DF['YEAR'] = (pd.to_datetime(AP_INT_DF['PERIOD_START_DT'])\
+    .apply(lambda x: x.strftime('%Y')))
+
+    AP_INT_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+    AP_FIN_DF = AP_INT_DF[['TERRITORY','ACCOUNT_ID','MONTH_ID','YEAR', 'PERIOD_START_DT', 'ACTIVITY_PLAN_ID', 'LAST_REFRESHED_DATE']]
+    uploadCSV('wh-medical-activity/wh-medical-activity.csv', AP_FIN_DF)
+
+FUNCTIONS = (wh_account, wh_product, wh_product_hierarchy, wh_territory, wh_user, \
+wh_target_class, wh_coaching, wh_acc_adoption_ladder_m, wh_survey, wh_mccp, wh_medical_activity)
+#FUNCTIONS = [wh_territory]
+for func in FUNCTIONS:
+    try:
+        print('Processing the function '+str(func))
+        func()
+    except Exception as e:
+        print(e)
+        continue
