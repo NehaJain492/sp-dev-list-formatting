@@ -1,0 +1,212 @@
+
+#!/usr/local/bin/python3
+"""Script to convert OCE_EXPORT TABLES INTO WAREHOUSE EMAIL DATA TABLE for BI reporting"""
+import csv
+import io
+import logging
+from datetime import datetime
+import pandas as pd
+import numpy as np
+import boto3
+
+import pyspark.sql.functions as f
+from pyspark.sql.functions import col, lit
+from pyspark.sql import SQLContext
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+CSV_BUFFER = io.StringIO()
+sc = SparkContext()
+glueContext = GlueContext(sc)
+logger = glueContext.get_logger()
+spark = glueContext.spark_session
+sqlcontext = SQLContext(sc)
+
+S3 = boto3.client('s3')
+S3RESOURCE = boto3.resource('s3')
+env = 'prod'
+CURR_DT = datetime.now()
+LAST_REFRESHED_DT = datetime.strftime(CURR_DT, '%Y-%m-%d %H:%M:%S')
+
+SRCBUCKET = 'victoria-prd-eu-lambda'
+WH_BUCKET = 'victoria-prd-s3-eu-warehouse'
+USRPATH = 'ioengage/data/aameo/{0}/csv/USER/'.format(env)
+TOP_PATH = 'ioengage/data/aameo/{0}/csv/OCE__TOPIC__C/'.format(env)
+OPT_DET_PATH = 'ioengage/data/aameo/{0}/csv/OCE__OPTDETAIL__C/'.format(env)
+
+EMAIL_TR_COLS = (['Id', 'CreatedDate', 'OwnerId', 'IsDeleted', 'OCE__Account__c', 'Name', \
+'OCE__AttachmentNames__c', 'OCE__EmailBouncedDate__c', 'OCE__EmailBouncedReason__c', \
+'OCE__EmailResponseStatus__c', 'OCE__EmailStatus__c', 'OCE__EmailStatusDate__c', \
+'OCE__EmailTemplate__c', 'OCE__FirstOpenedDate__c', 'OCE__LastClickedDate__c', \
+'OCE__LastOpenedDate__c', 'OCE__LatestTrackingEventDate__c', 'OCE__MessageStatus__c', \
+'OCE__Sender__c', 'OCE__SentDate__c', 'OCE__SentTo__c', 'OCE__Subject__c', \
+'OCE__EmailQueue__c', 'OCE__TimesOpened__c'])
+EMAIL_TEMP_COLS = (['Id', 'Name', 'OCE__Product__c', 'OCE__Description__c', 'OCE__Topic__c', \
+'OCE__AttachICSFile__c', 'OCE__EndDate__c', 'OCE__IsActive__c', 'NNAE_Product__c', 'NNAE_Core_Category__c', \
+'NNAE_Sub_Category__c', 'NNAE_Key_Messages__c'])
+EMAIL_Q_COLS = ['Id', 'OCE__LastAttempt__c']
+EMAIL_Q_ATT_COLS = ['Id', 'OCE__TimesClicked__c', 'OCE__IsBounced__c']
+TOP_COLS = ['Id', 'Name']
+OPT_DET_COLS = (['OCE__Opt__c', 'OCE__Channel__c', 'OCE__Subscription__c', 'Name', \
+'OCE__Topic__c', 'OCE__ChannelValue__c', 'CurrencyIsoCode'])
+OPT_COLS = (['Id', 'OCE__Account__c', 'OCE__ParentTopic__c', 'OCE__Active__c', 'Name', 'OwnerId', \
+'OCE__IsActive__c', 'OCE__OptDate__c', 'OCE__OfflineCreatedDate__c', 'OCE__RequestReceipt__c', \
+'OCE__Source__c', 'OCE__DocumentId__c', 'OCE__DisclaimerText__c', 'CreatedDate', \
+'OCE__SalesRep__c', 'OCE__OfflineCreatedByID__c', 'CreatedById'])
+
+def csv_dataframe(prefix, encoding, columns):
+    s3resource = boto3.resource('s3')
+    bucket = s3resource.Bucket(SRCBUCKET)
+    prefix_objs = bucket.objects.filter(Prefix=prefix)
+    prefix_df = []
+    filter_cols = ['Id', 'LastModifiedDate']
+    for obj in prefix_objs:
+        if '.csv' in obj.key:
+            body = obj.get()['Body'].read().decode(encoding)
+            df = (pd.read_csv(io.StringIO(body), quotechar='"', sep='\t', dtype='str', \
+            error_bad_lines=False, usecols=columns+filter_cols))
+            prefix_df.append(df)
+    DF = pd.concat(prefix_df).sort_values(by='LastModifiedDate')
+    DF = DF.drop_duplicates(['Id'], keep='last')[columns]
+    return DF
+
+def uploadCSV(OBJ_PATH, FINAL_DF):
+#Make sure that boto3 module is imported and s3 resource is referred
+    DESTBUCKET = WH_BUCKET
+    DESTMASTERPATH = 'ioengage/data/aameo/{0}/csv/'.format(env)
+    if not FINAL_DF.empty:
+        csv_buffer = io.StringIO()
+        (FINAL_DF.to_csv(csv_buffer, sep=',', quotechar='"', encoding='utf-8', quoting=csv.QUOTE_ALL, \
+        index=False))
+        S3RESOURCE.Object(DESTBUCKET, DESTMASTERPATH+OBJ_PATH).put(Body=csv_buffer.getvalue())
+        print("loaded "+OBJ_PATH)
+    else:
+        print(OBJ_PATH+' is Empty')
+
+bucket1 = boto3.resource('s3').Bucket(WH_BUCKET)
+TRT_D_objs = bucket1.objects.filter(Prefix='ioengage/data/aameo/{0}/csv/wh-territory-d/'.format(env))
+TRT_prefix_df = []
+for obj in TRT_D_objs:
+    if '.csv' in obj.key:
+        body = obj.get()['Body'].read().decode('utf-8')
+        df = (pd.read_csv(io.StringIO(body), quotechar='"', sep=',', dtype='str', \
+        error_bad_lines=False))
+        TRT_prefix_df.append(df)
+
+TRT_FD_HIST_DF = (pd.concat(TRT_prefix_df).sort_values(by='MONTH_ID')[['Name', 'UserId', 'MONTH_ID', \
+'LastModifiedDate']].drop_duplicates())
+TRT_HIST_DF = TRT_FD_HIST_DF[['Name', 'UserId', 'MONTH_ID']].drop_duplicates()
+TRT_HIST_DF.columns = ['TERRITORY', 'OCE__User__c', 'MONTH_ID']
+
+def wh_email_data():
+    """Function to create wh_email_data TABLE"""
+    USER_DF = csv_dataframe(USRPATH, 'utf-8', ['Id', 'TimeZoneSidKey'])
+    USER_DF.columns = ['OwnerId', 'TIME_ZONE']
+    OPT_DF = (spark.read.option("header", True).option("delimiter","\t").format("csv")\
+    .load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__OPT__C/*.csv"\
+    .format(env)).select(OPT_COLS))
+    print("read opt")
+    OPT_DF = OPT_DF.where("OCE__Active__c == 'True'")
+    OPT_DF = OPT_DF.toPandas()
+    E_OPT = OPT_DF[['Id', 'OCE__Account__c', 'OCE__ParentTopic__c']].drop_duplicates()
+    E_OPT = E_OPT.rename({'Id':'OCE__Opt__c'}, axis=1)
+    OPT_DET_DF = csv_dataframe(OPT_DET_PATH, 'utf-8', OPT_DET_COLS)
+    EM_TR_DF = (spark.read.option("header", True).option("delimiter","\t").format("csv")\
+    .load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__EMAILTRANSACTION__C/*.csv"\
+    .format(env)).select(EMAIL_TR_COLS))
+    EM_TR_DF = EM_TR_DF.where(col("CreatedDate") > lit("2023-03-31"))
+    EM_TR_DF = EM_TR_DF.toPandas()
+    print("read_transaction")
+    #EM_TR_DF = EM_TR_DF[~(EM_TR_DF['CreatedDate'].str.contains('2019')|EM_TR_DF['CreatedDate'].str.contains('2020')|EM_TR_DF['CreatedDate'].str.contains('2021'))]
+    EM_TEMP_DF = (spark.read.option("header", True).option("delimiter","\t").format("csv")\
+    .load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__EMAILTEMPLATE__C/*.csv"\
+    .format(env)).select(EMAIL_TEMP_COLS))
+    EM_TEMP_DF = (EM_TEMP_DF.withColumnRenamed("Id","OCE__EmailTemplate__c")\
+    .withColumnRenamed('Name', 'Template_Name'))
+    EM_TEMP_DF = EM_TEMP_DF.toPandas()
+    TOP_DF = csv_dataframe(TOP_PATH, 'utf-8', TOP_COLS)
+    TOP_DF = TOP_DF.rename({'Id':'OCE__Topic__c', 'Name':'Template_Topic'}, axis=1)
+    EM_Q_DF = (spark.read.option("header", True).option("delimiter","\t").format("csv")\
+    .load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__EMAILQUEUE__C/*.csv"\
+    .format(env)).select(EMAIL_Q_COLS))
+    print("read_queue")
+    EM_Q_DF = EM_Q_DF.withColumnRenamed("Id","OCE__EmailQueue__c")
+    EM_Q_DF = EM_Q_DF.toPandas()
+    EM_Q_ATT_DF = (spark.read.option("header", True).option("delimiter","\t").format("csv")\
+    .load("s3://victoria-prd-eu-lambda/ioengage/data/aameo/{0}/csv/OCE__EMAILQUEUEATTEMPT__C/*.csv"\
+    .format(env)).select(EMAIL_Q_ATT_COLS))
+    EM_Q_ATT_DF = EM_Q_ATT_DF.withColumnRenamed("Id","OCE__LastAttempt__c")
+    EM_Q_ATT_DF = EM_Q_ATT_DF.toPandas()
+    OPTDET_DF = (OPT_DET_DF[OPT_DET_DF['OCE__Channel__c']\
+    .isin(['Email'])][['OCE__Opt__c', 'OCE__Subscription__c']])
+    EM_TZ_DF = pd.merge(EM_TR_DF, USER_DF, on='OwnerId', how='left')
+    EM_TZ_DF['CreatedDate'] = pd.to_datetime(EM_TZ_DF['CreatedDate'])
+    EM_TZ_DF['OCE__EmailBouncedDate__c'] = pd.to_datetime(EM_TZ_DF['OCE__EmailBouncedDate__c'])
+    EM_TZ_DF['OCE__EmailStatusDate__c'] = pd.to_datetime(EM_TZ_DF['OCE__EmailStatusDate__c'])
+    EM_TZ_DF['OCE__FirstOpenedDate__c'] = pd.to_datetime(EM_TZ_DF['OCE__FirstOpenedDate__c'])
+    EM_TZ_DF['OCE__LastClickedDate__c'] = pd.to_datetime(EM_TZ_DF['OCE__LastClickedDate__c'])
+    EM_TZ_DF['OCE__LastOpenedDate__c'] = pd.to_datetime(EM_TZ_DF['OCE__LastOpenedDate__c'])
+    EM_TZ_DF['OCE__LatestTrackingEventDate__c'] = pd.to_datetime(EM_TZ_DF['OCE__LatestTrackingEventDate__c'])
+    EM_TZ_DF['OCE__SentDate__c'] = pd.to_datetime(EM_TZ_DF['OCE__SentDate__c'])
+    EM_TZ_DF['CreatedDate'] =  (EM_TZ_DF.groupby('TIME_ZONE')['CreatedDate']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    print("1")
+    EM_TZ_DF['OCE__EmailBouncedDate__c'] =  (EM_TZ_DF.groupby('TIME_ZONE')\
+    ['OCE__EmailBouncedDate__c'].transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    EM_TZ_DF['OCE__EmailStatusDate__c'] =  (EM_TZ_DF.groupby('TIME_ZONE')\
+    ['OCE__EmailStatusDate__c'].transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    EM_TZ_DF['OCE__FirstOpenedDate__c'] =  (EM_TZ_DF.groupby('TIME_ZONE')\
+    ['OCE__FirstOpenedDate__c'].transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    EM_TZ_DF['OCE__LastClickedDate__c'] =  (EM_TZ_DF.groupby('TIME_ZONE')\
+    ['OCE__LastClickedDate__c'].transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    EM_TZ_DF['OCE__LastOpenedDate__c'] =  (EM_TZ_DF.groupby('TIME_ZONE')\
+    ['OCE__LastOpenedDate__c'].transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    EM_TZ_DF['OCE__LatestTrackingEventDate__c'] =  (EM_TZ_DF.groupby('TIME_ZONE')\
+    ['OCE__LatestTrackingEventDate__c'].transform(lambda x: x.dt.tz_convert(x.name)\
+    .dt.tz_localize(None)))
+    print("2")
+    EM_TZ_DF['OCE__SentDate__c'] =  (EM_TZ_DF.groupby('TIME_ZONE')['OCE__SentDate__c']\
+    .transform(lambda x: x.dt.tz_convert(x.name).dt.tz_localize(None)))
+    EM_TZ_DF['MONTH_ID'] = (EM_TZ_DF.apply(lambda x: x['CreatedDate'].strftime('%m%Y') \
+    if pd.isnull(x['OCE__SentDate__c']) else x['OCE__SentDate__c'].strftime('%m%Y'), axis=1))
+    Rec_Count = 0
+    for g, df in EM_TZ_DF.groupby(np.arange(len(EM_TZ_DF)) // 100000):
+        Rec_Count = Rec_Count+1
+        EM_TRT_DF = (pd.merge(df, TRT_HIST_DF, left_on=['OwnerId', 'MONTH_ID'], \
+        right_on=['OCE__User__c', 'MONTH_ID'], how='left'))
+        EM_INIT_DF = (pd.merge(pd.merge(EM_TRT_DF, \
+        EM_TEMP_DF[EM_TEMP_DF['OCE__AttachICSFile__c'].isin(['False'])], \
+        on='OCE__EmailTemplate__c', how='inner'), TOP_DF, on='OCE__Topic__c', how='left'))
+        EM_OPT_DF = (pd.merge(EM_INIT_DF, E_OPT, left_on=['OCE__Account__c', 'OCE__Topic__c'], \
+        right_on=['OCE__Account__c', 'OCE__ParentTopic__c'], how='left').drop_duplicates())
+        EM_OPT_Q_DF = (pd.merge(pd.merge(pd.merge(EM_OPT_DF, OPTDET_DF, on='OCE__Opt__c', \
+        how='left'), EM_Q_DF, on='OCE__EmailQueue__c', how='left'), EM_Q_ATT_DF, \
+        on='OCE__LastAttempt__c', how='left'))
+        print("3")
+        EM_OPT_Q_DF.loc[EM_OPT_Q_DF['OCE__IsBounced__c'].isin(['True']), 'OCE__MessageStatus__c'] = 'Failed'
+        EM_OPT_Q_DF.loc[EM_OPT_Q_DF['OCE__IsBounced__c'].isin(['True']), 'OCE__EmailStatus__c'] = 'Bounced'
+        EM_OPT_Q_DF['LAST_REFRESHED_DATE'] = LAST_REFRESHED_DT
+        EM_FIN_DF = (EM_OPT_Q_DF[['Id', 'CreatedDate', 'OwnerId', 'IsDeleted', 'OCE__Account__c', \
+        'OCE__Product__c', 'Name', 'OCE__AttachmentNames__c', 'OCE__EmailBouncedDate__c', \
+        'OCE__EmailBouncedReason__c', 'OCE__EmailResponseStatus__c', 'OCE__EmailStatus__c', \
+        'OCE__EmailStatusDate__c', 'OCE__EmailTemplate__c', 'Template_Name', 'OCE__Description__c', \
+        'Template_Topic', 'OCE__FirstOpenedDate__c', 'OCE__LastClickedDate__c', \
+        'OCE__LastOpenedDate__c', 'OCE__LatestTrackingEventDate__c', 'OCE__MessageStatus__c', \
+        'OCE__Sender__c', 'OCE__SentDate__c', 'OCE__SentTo__c', 'OCE__Subject__c', \
+        'OCE__TimesOpened__c', 'OCE__Subscription__c', 'MONTH_ID', 'TERRITORY', \
+        'OCE__TimesClicked__c', 'OCE__EndDate__c', 'OCE__IsActive__c', 'LAST_REFRESHED_DATE', 'NNAE_Product__c', \
+        'NNAE_Core_Category__c', 'NNAE_Sub_Category__c', 'NNAE_Key_Messages__c']].drop_duplicates())
+        uploadCSV('wh-email-data/wh-email-data-'+str(Rec_Count)+'.csv', EM_FIN_DF)
+
+FUNCTIONS = [wh_email_data]
+
+for func in FUNCTIONS:
+    try:
+        print('Processing the function '+str(func))
+        func()
+    except Exception as e:
+        print(e)
+        continue
