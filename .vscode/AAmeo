@@ -1,0 +1,618 @@
+#!/usr/bin/python
+'''
+ZABE :: Global MPP Master SPEC
+
+Change Log:
+
+YRAR :: 11-Oct-2022 :: Added the script to load only the latest OCE__ClickStreamMetric__c object records from 2022 June onwards
+from AAMEO PROD IO Engage instance. (Script line 162-164)
+
+USZS :: 7Apr: Added script to filter aameo uat for last modified date >1st Jan 2023
+'''
+# Standard library imports
+import io
+import os
+import re
+import csv
+import sys
+import ast
+import time
+import s3fs
+import json
+import uuid
+import base64
+import requests
+import socket
+import logging
+import tempfile
+import hashlib
+import smtplib
+import configparser
+import datetime as dt
+from io import StringIO
+from awsglue.utils import getResolvedOptions
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from botocore.exceptions import ClientError
+from email.mime.multipart import MIMEMultipart
+# Third party imports
+import boto3
+from boto3.dynamodb.conditions import Key
+import pandas as pd
+from pandas import json_normalize
+#import s3fs
+def _describe(quires, instance_url, token , s3_resource, logger, pd, sf_config_metaendpoint, object_loc_meta_bucket,object_loc_meta_key):
+    describe_error = []
+    flag_firstrun = True
+    p_data = pd.DataFrame()
+    for objects in quires:
+        make_url = str(instance_url) + str('{0}{1}/describe/'.format(str(sf_config_metaendpoint),str(objects)))
+        try:
+            R = requests.get(str(make_url),headers={'Authorization': 'Bearer ' + token, 'Content-type': 'application/json'})
+            response_data = R.json()
+            name = response_data['name']
+            print("============================{0}".format(name))
+            keyprefix = response_data['keyPrefix']
+        except TypeError:
+            describe_error.append(str(objects))
+            continue
+        if (describe_error):
+            logger.info("_describe : META VISIBILITY FOR THE FOLLOWING - {0}".format(describe_error))
+        fields_data = json.dumps(response_data['fields'])
+        fields = json.loads(fields_data)
+        pfields = json_normalize(fields)
+        pfields = pfields[['name','type','encrypted','custom','byteLength','length','precision','scale']]
+        pfields.insert(0, 'keyprefix', keyprefix)
+        pfields.insert(0, 'object', name)
+        pfields.replace({r'\A\s+|\s+\Z': '', '\n' : ' '}, regex=True, inplace=True)
+        if flag_firstrun:
+            p_data = pfields
+            flag_firstrun = False
+        else:
+            p_data = p_data.append(pfields)
+    csv_buffer = io.StringIO()
+    p_data.to_csv(csv_buffer, sep='\t', encoding='utf-8', quoting=csv.QUOTE_ALL, quotechar='"', header=True, index=False)
+    '''
+    In subsequent line, please add all the compound salesforce data types.
+    '''
+    p_df = p_data[~p_data['type'].isin(['address'])]   #Changed for ADDRESS TYPE
+    #p_df['name'] = p_df['name'].str.lower()
+    grouped_df = p_df.groupby('object')['name'].apply(list)
+    grouped_df.index = grouped_df.index.str.lower()
+    object_names = grouped_df.index
+    s3_resource.Object('{0}'.format(str(object_loc_meta_bucket)), '{0}'.format(str(object_loc_meta_key))).put(Body=csv_buffer.getvalue())
+    csv_buffer.close()
+    logger.info("_describe : Succesfully Completed execution")
+    return (object_names, grouped_df)
+def _define(s3_client, run_env, logger, object_loc_admin_bucket, object_loc_admin_key, object_loc_objlist_bucket, object_loc_objlist_key, config_lexi_env):
+    config = configparser.ConfigParser()
+    try :
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            logger.info('Downloading File : {0}/{1}/config.ini'.format(str(object_loc_admin_bucket),str(object_loc_admin_key)))
+            s3_client.download_file('{0}'.format(str(object_loc_admin_bucket)), '{0}/config.ini'.format(str(object_loc_admin_key)), '/{0}/config.ini'.format(tmp_dir))
+            config.read('/{0}/config.ini'.format(tmp_dir))
+            payload = {"client_id" : str(config['{0}'.format(str(config_lexi_env))]['client_id']),
+                "client_secret" : str(config['{0}'.format(str(config_lexi_env))]['client_secret']),
+                "username" : str(config['{0}'.format(str(config_lexi_env))]['username']),
+                "password" : str(config['{0}'.format(str(config_lexi_env))]['password'])+str(config['{0}'.format(str(config_lexi_env))]['stoken']),
+                "grant_type" : "password",
+                "redirect_uri" : "https://{0}.salesforce.com/services/oauth2/success".format("login" if run_env == 'prod' else "test")}
+    except Exception as e:
+        logger.error("_define : {0}".format(str(e)))
+        #_Sendmail("ERROR", str(BREADCRUMB), RECIPIENT)
+        exit(0)
+    try:
+        fs = s3fs.S3FileSystem(anon=False)
+        logger.info("s3://{0}/{1}".format(str(object_loc_objlist_bucket), str(object_loc_objlist_key)))
+        object_file = fs.open("s3://{0}/{1}".format(str(object_loc_objlist_bucket), str(object_loc_objlist_key)), "r")
+    except FileNotFoundError:
+        logger.error("_define : Object file is not present")
+        #_Sendmail("ERROR", str(BREADCRUMB), RECIPIENT)
+        exit(0)
+    try:
+        R = requests.post("https://{0}.salesforce.com/services/oauth2/token".format("login" if run_env == 'prod' else "test"), \
+        headers={"Content-Type":"application/x-www-form-urlencoded"}, data=payload)
+    except requests.exceptions.Timeout:
+        logger.error("_define : SFDC AUTH TIMEOUT")
+        #_Sendmail("ERROR", str(BREADCRUMB), RECIPIENT)
+        exit(0)
+    except requests.exceptions.TooManyRedirects:
+        logger.error("_define : SFDC AUTH REDIRECT LOOP")
+        #_Sendmail("ERROR", str(BREADCRUMB), RECIPIENT)
+        exit(0)
+    except requests.exceptions.RequestException as e:
+        logger.error("_define : SFDC AUTH PAYLOAD ERROR - {0}".format(str(e)))
+        #_Sendmail("ERROR", str(BREADCRUMB), RECIPIENT)
+        exit(0)
+    response_data = json.loads(R.text)
+    sf_token = response_data['access_token']
+    sf_instance_url = response_data['instance_url']
+    quires_normal = object_file.read().split(',') 
+    quires_upper = [x.upper() for x in quires_normal]
+    quires_dup = list(dict.fromkeys(quires_upper))
+    quires = list(set(quires_dup))
+    return(str(sf_instance_url), sf_token, sf_instance_url, quires)
+def _getCount(logger, object_list, quires, instance_url, token, sf_config_countendpoint, sf_config_sosqlendpoint):
+    make_url = str(instance_url) + str('{0}{1}'.format(str(sf_config_countendpoint),str(object_list)))
+    METAQL = str(instance_url) + str(sf_config_sosqlendpoint) + "COUNT()+FROM+"
+    sorted_objects = {}
+    try:
+        R = requests.get(str(make_url),headers={'Authorization': 'Bearer ' + token, 'Content-type': 'application/json'})
+        response_data = R.json()
+        oj_dict = json.loads(json.dumps(response_data['sObjects']))
+        for objects in quires:
+            if objects not in [ ob['name'] for ob in oj_dict ]:
+                R = requests.get("{0}{1}".format(str(METAQL),objects),headers={'Authorization': 'Bearer ' + token, 'Content-type': 'application/json'})
+                response_data = R.json()
+                try:
+                    oj_dict.append({"count":response_data['totalSize'],"name":objects})
+                except TypeError:
+                    continue
+        sorted_objects = sorted(oj_dict, key = lambda i: i['count'])
+    except TypeError:
+        logger.error("_getCount : RECORDCOUNT NOT IN JSON")
+        return({})           
+    logger.error("_getCount : Succesfully Completed execution")
+    print(sorted_objects)
+    return(sorted_objects)
+def _API(api_sosql, object_name, instance_url, nexturl, token, s3_resource, columns, custom_query, dydb_client, \
+run_control_table_regionhash, object_loc_data_bucket, object_loc_data_bucket_key, run_control_table, run_child_lambda, \
+run_control_logtable_hash, logtableobject):
+    object_size = 0
+    flag_single_page = True
+    lambda_client = boto3.client("lambda")
+    if (object_name == 'OCE__CLICKSTREAMMETRIC__C' and 'aameo' in object_loc_data_bucket_key and 'prod' in object_loc_data_bucket_key and 'ioengage' in object_loc_data_bucket_key):
+        call_url = str(instance_url)+ str(api_sosql)+ ' where oce__usagestarttime__c >= 2023-08-31T23:59:59Z'
+    #elif ('aameo' in object_loc_data_bucket_key and 'uat' in object_loc_data_bucket_key and 'ioengage' in object_loc_data_bucket_key):
+    #   call_url = str(instance_url)+ str(api_sosql)+ ' where lastmodifieddate >= 2023-01-01T23:59:59Z'
+    else:
+        call_url = str(instance_url)+ str(api_sosql)
+    data_key = "{0}/csv/{1}".format(str(object_loc_data_bucket_key),str(object_name))
+    #response=dydb_logtable.put_item(Item={'hash': '{0}-{1}.csv'.format(str(run_control_logtable_hash),str(logtableobject)), \
+    #'function': '{0}'.format(str(logtableobject)),'fileName':'{0}.csv'.format(str(object_name)),'startTime':'{0}'.format(str(time.time())),'endTime':'','CompleteFlag':'false'})
+    try:
+        response = requests.get(str(call_url), headers={'Authorization': 'Bearer ' + token, \
+        'Content-type': 'application/json', 'Sforce-Query-Options': 'batchSize=2000'})
+        json_response = response.json()
+        flag_end = json_response['done']
+    except Exception as general_exp:
+        print(general_exp)
+        print(response.text)
+        return (0)
+    object_size = json_response['totalSize']
+    if not flag_end:
+        nexturl = str(instance_url) + str(json_response['nextRecordsUrl'])
+        C = nexturl.split("-")
+    else:
+        print("Total records were less than one page for - ",str(object_name))
+        flag_single_page = False
+    records = json.dumps(json_response['records'])
+    rec_data = json.loads(records)
+    for element in rec_data:
+        del element['attributes']
+    pd_data = json_normalize(rec_data)
+    pd_data.fillna('', inplace=True)
+    pd_data = pd_data.astype('unicode')
+    # change for japan region: replace new line character with <br> ch0001
+    if run_region == 'japan-nososql':
+        pd_data.replace({r'\A\s+|\s+\Z': '', '\n' : '<br>'}, regex=True, inplace=True)
+        pd_data.replace(r'\n', '<br>', regex=True, inplace=True)
+    else:
+        pd_data.replace({r'\A\s+|\s+\Z': '', '\n' : ' '}, regex=True, inplace=True)
+        pd_data.replace(r'\n', ' ', regex=True, inplace=True)
+    # change for japan region: replace new line character with <br> ch0001
+    
+    # pd_data.replace({r'\A\s+|\s+\Z': '', '\n' : ' '}, regex=True, inplace=True) # commented for ch0001
+    pd_data.replace(r'\r', ' ', regex=True, inplace=True)
+    # pd_data.replace(r'\n', ' ', regex=True, inplace=True) # commented for ch0001
+    if(custom_query == 'True'):
+        pd_align = pd.DataFrame(columns=columns)
+        pd_1,pd_aligned = pd_align.align(pd_data, join='left', axis=1)
+        pd_data = pd_aligned
+        del pd_align
+        del pd_1
+    pd_col = list(pd_data.columns)
+    csv_buffer = io.StringIO()
+    pd_data.to_csv(csv_buffer, sep='\t', encoding='utf-8',quoting=csv.QUOTE_ALL, quotechar='"', \
+    header=True,index_label='row_number')
+    #Clean S3 bucket key first
+    print("Deleting KEY {0}".format(str(data_key)))
+    del_bucket = s3_resource.Bucket('{0}'.format(str(object_loc_data_bucket)))
+    del_bucket.objects.filter(Prefix="{0}/".format(str(data_key))).delete()
+    s3_resource.Object('{0}'.format(str(object_loc_data_bucket)),'{0}/{1}.csv'.format(str(data_key),str(object_name))).put(Body=csv_buffer.getvalue())
+    csv_buffer.close()
+    #dy_resp = dydb_client.delete_item(TableName='global-mpp-logtable', \
+        #Key={'hash':{'S':'{0}-{1}.csv'.format(str(run_control_logtable_hash),str(logtableobject))}, \
+        #'function':{'S':'{0}'.format(str(logtableobject))}})
+    #response = dydb_logtable.update_item(Key={'hash': '{0}-{1}.csv'.format(str(run_control_logtable_hash),str(logtableobject)), \
+        #'function': '{0}'.format(str(logtableobject))},UpdateExpression="SET endTime = :et,CompleteFlag = :cf",ExpressionAttributeValues={':et': '{0}'.format(str(time.time())),':cf':'true',},ReturnValues="UPDATED_NEW")
+    if flag_single_page:
+        lambda_payload={ \
+        "makeurl": str(nexturl),\
+        "start": str(C[len(C)-1]), \
+        "end": str(object_size), \
+        "token": str(token), \
+        "step" : int(C[len(C)-1]), \
+        "endflag" : "false", \
+        "multiplier" : int(4000/int(C[len(C)-1])), \
+        "mode" : "PARENT", \
+        "object_name" : str(object_name).upper(), \
+        "bucket" : str(object_loc_data_bucket), \
+        "bucket_key" : str(data_key), \
+        "columns" : pd_col, \
+        "region_hash" : str(run_control_table_regionhash), \
+        "objectname_hash" : str(logtableobject), \
+        "run_control_table" : str(run_control_table), \
+        "run_control_logtable_hash" : str(run_control_logtable_hash), \
+        "logtableobject" : str(logtableobject)
+        }
+        dydb_response = dydb_client.put_item(TableName='{0}'.format(str(run_control_table)), \
+            Item={'REGIONHASH':{'S':'{0}'.format(run_control_table_regionhash)}, \
+                'METHODHASH':{'S':'{0}'.format(str(logtableobject))}})
+        try:
+            response = lambda_client.invoke(
+                    FunctionName="{0}".format(str(run_child_lambda)),
+                    InvocationType='Event',
+                    Payload=json.dumps(lambda_payload)
+                )
+        except Exception as LAMBDA_EXP:
+            return(0)
+    return(1)
+def _sendmail(mail_object, table, subject, mail_to):
+    mail_body = mail_object.get()['Body'].read().decode()
+    mail_body = mail_body.replace("&lt;&lt;ENV", str(run_env).upper())
+    mail_body = mail_body.replace("&lt;&lt;PROJECT", str(run_project).upper())
+    mail_body = mail_body.replace("&lt;&lt;REG", str(run_region).upper())
+    mail_body = mail_body.replace("&lt;&lt;TABLE", str(table))
+    msg = MIMEMultipart('alternative')
+    password = '!r7)-3<VK^xs"ZUw'
+    msg['From'] = "victoria@novonordisk.com"
+    msg['To'] = ", ".join(mail_to)
+    msg['Subject'] = subject
+    part = MIMEText(mail_body, 'html')
+    msg.attach(part)
+    # Send the message via local SMTP server.
+    server = smtplib.SMTP('smtp.office365.com: 587')
+    server.starttls()
+    server.login(msg['From'], password)
+    server.sendmail(msg['From'], mail_to, msg.as_string())
+    server.quit()
+args = getResolvedOptions(sys.argv, ['JOB_NAME','RUN_ENV','RUN_PROJECT','RUN_REGION','RUN_AWS_ENV','CONFIG_SF_ENV','OBJECT_FILE','EMAIL_RECIPIENTS','SPECIAL_CHECK'])
+flag_object = False
+flag_crawler = False
+single_object_name=''
+custom_crawler_name=''
+if ('--OBJECT_NAME' in sys.argv):
+    moduleargs = getResolvedOptions(sys.argv, ['OBJECT_NAME'])
+    flag_object = True
+    single_object_name = moduleargs['OBJECT_NAME']
+if ('--CUSTOM_CRAWLER' in sys.argv):
+    moduleargs = getResolvedOptions(sys.argv, ['CUSTOM_CRAWLER'])
+    flag_crawler = True
+    custom_crawler_name = moduleargs['CUSTOM_CRAWLER']
+event = { \
+    "run_env": args['RUN_ENV'], \
+    "run_project": args['RUN_PROJECT'], \
+    "run_region": args['RUN_REGION'], \
+    "run_aws_env": args['RUN_AWS_ENV'], \
+    "config_sf_env": args['CONFIG_SF_ENV'], \
+    "object_file": args['OBJECT_FILE'], \
+    "email_recipients": ast.literal_eval(args['EMAIL_RECIPIENTS']), \
+    "special_check": args['SPECIAL_CHECK']
+}
+#print(event["email_recipients"])
+#print(type(event["email_recipients"]))
+#print(type(args['EMAIL_RECIPIENTS']))
+#Set Global Variables
+'''
+run variables are important to set the preference 
+to gather config values as well as set s3 location.
+Values to be set in lowercase
+'''
+run_time = time.time()
+run_env = event["run_env"]              #Environment ?
+run_project = event["run_project"]      #Project ?
+run_region = event["run_region"]        #Region
+run_aws_env = event["run_aws_env"]      #AWS Region  
+flag_test = True                        #Is it a test ?
+run_child_lambda = 'victoria-prd-mpp-child-global'
+run_control_batchsize = 5
+run_control_table = 'global-mpp-controltable' #Which Dynamodb table controls the MPP batches ?
+run_control_logtable = 'global-mpp-logtable' #Which Dynamodb table logs the MPP batches ?
+run_control_table_region = "{0}{1}ioreg".format(str(run_region),str(run_env))
+run_control_logtable_hash = "{0}-{1}-{2}-{3}".format(str(run_time),str(run_project),str(run_region),str(run_env))
+run_control_table_regionhash = run_control_logtable_hash
+#str(hashlib.md5(run_control_table_region.encode()).hexdigest())
+'''
+object location variables declare the place for 
+meta , object as well as data files.
+'''
+mail_template_bucket = "victoria-prd-eu-lambda"
+mail_template_file = "{0}/mail/template.html".format(str(run_project))
+mail_errortemplate_file = "{0}/mail/errortemplate.html".format(str(run_project))
+object_loc_meta_bucket = "victoria-prd-eu-lambda"
+object_loc_objlist_bucket = "victoria-prd-eu-lambda"
+object_loc_data_bucket = "victoria-prd-eu-lambda"
+object_loc_admin_bucket = "victoria-prd-eu-lambda"
+object_loc_meta_key = "{0}/meta/{1}/{2}/meta.csv".format(str(run_project), str(run_region), str(run_env))                   #Where should the meta be stored ?
+if "object_file" in event.keys():
+    object_loc_objlist_key = "{0}/objectlist/{1}/{2}/{3}".format(str(run_project), str(run_region), str(run_env), str(event["object_file"]))    #where is the objectlist stored ?
+else:
+    object_loc_objlist_key = "{0}/objectlist/{1}/{2}/objectlist.dat".format(str(run_project), str(run_region), str(run_env))    #where is the objectlist stored ?
+object_loc_data_bucket_key = "{0}/data/{1}/{2}".format(str(run_project), str(run_region), str(run_env))                     #where should the data be stored ?
+object_loc_admin_key = "{0}/admin/{1}/{2}".format(str(run_project), str(run_region), str(run_env))                          #where should the custom call files and other admin related files be stored ?
+'''
+config variables declare the place for config files 
+as well as sets the dynamodb preference 
+'''
+config_sf_env = event["config_sf_env"] #Salesforce config name in CONFIG.ini
+if "config_lexi_env" in event.keys():
+    config_lexi_env = event["config_lexi_env"]  #Any lexi objects ?
+else:
+    config_lexi_env = ""
+config_dydbtbl = ''             ##DYDB TABLE NAME
+config_dydbtbl_reg = ''         ##MAKE THIS SOMETHING THAT CAN BE GOTTEN FROM THE CONFIG OR INFERRED
+config_ses_sender = ''          ##CONFIF SES 
+config_ses_recipient = []       ##CONFIG SES RECIEVERS
+'''
+sf config variables store the aPI preferences from salesforce
+'''
+sf_config_api_ver = "v47.0" if run_project == 'ioengage' else "v50.0"        #What is the sf api version
+sf_config_metaendpoint = "/services/data/{0}/sobjects/".format(sf_config_api_ver) #sObjects descibe metadata endpoint
+sf_config_sosqlendpoint = "/services/data/{0}/query?q=SELECT+".format(sf_config_api_ver) #query=?sosql endpoint
+sf_config_countendpoint = "/services/data/{0}/limits/recordCount?sObjects=".format(sf_config_api_ver) #Record count endpoint - requires LIMITS access
+'''
+custom call variables store any calls which do not use
+meta to create sosql/ or dont use sosql endpoint
+'''
+custom_call_sosql = '{0}/sosql.txt'.format(str(object_loc_admin_key))           #Non relational sosql custom quires file
+custom_call_lexi = '{0}/lexi_objects.txt'.format(str(object_loc_admin_key))     #Object file to get lexi based objects
+custom_call_relql = '{0}/rel_sosql.txt'.format(str(object_loc_admin_key))       #Relational sosql custom quires file
+flag_lexi_object = False
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logger.info('## EVENT')
+logger.info(event)
+s3_client = boto3.client('s3')
+s3_resource = boto3.resource('s3')
+dydb_client = boto3.client('dynamodb')
+dydb_resource = boto3.resource('dynamodb', region_name='eu-central-1')
+dydb_logtable = dydb_resource.Table(run_control_logtable)
+nexturl, token, instance_url, quires = \
+    _define(s3_client, run_env, logger, object_loc_admin_bucket, object_loc_admin_key, object_loc_objlist_bucket, object_loc_objlist_key, config_sf_env)
+print("define completed")
+sorted_objects = \
+    _getCount(logger,str('{0}'.format(','.join(map(str, quires)))),quires,instance_url,token,sf_config_countendpoint,sf_config_sosqlendpoint)
+print("Get count Completed")
+object_names, grouped_df = \
+    _describe(quires, instance_url, token , s3_resource, logger, pd, sf_config_metaendpoint, object_loc_meta_bucket,object_loc_meta_key)
+print("Describe Completed")
+logger.info('## ALL OBJECT NAMES')
+logger.info(object_names)
+non_null_object_names = [objects for objects in sorted_objects if objects['count'] != 0]
+print(non_null_object_names)
+lexi_object_names = {}
+customsosql_object_names = {}
+customrelql_object_names = {}
+ran_objects = {}
+'''
+Check if lexi objects are present - if yes, add all objects in it with count as 1
+'''
+existing_check = False
+try:
+    #with open("{0}".format(custom_call_lexi), "r") as lexi_call_data:
+    lexi_call_data_obj = s3_resource.Object(object_loc_admin_bucket,custom_call_lexi)
+    pre_lexi_object_name = ast.literal_eval(lexi_call_data_obj.get()['Body'].read().decode('utf-8'))
+    lexi_object_names = dict((k.upper(), v) for k,v in pre_lexi_object_names.items())
+    flag_lexi_object = True
+    for keys,value in lexi_object_names.items():
+        existing_check = False
+        for obj in non_null_object_names:
+            if str(keys).upper() in obj['name']:
+                existing_check=True
+        if existing_check:
+            continue
+        else:
+            non_null_object_names.append({"count":1,"name":str(keys)})
+    logger.info("## LEXI OBJECT - present")
+except s3_resource.meta.client.exceptions.NoSuchKey as err :
+    logger.info("## LEXI OBJECT - Not present - {0}".format(str(err)))
+'''
+Check if custom sosql calls are present.
+'''
+try:
+    custom_call_data_obj = s3_resource.Object(object_loc_admin_bucket,custom_call_sosql)
+    pre_customsosql_object_names = ast.literal_eval(custom_call_data_obj.get()['Body'].read().decode('utf-8'))
+    customsosql_object_names = dict((k.upper(), v) for k,v in pre_customsosql_object_names.items())
+    for keys,value in customsosql_object_names.items():
+        existing_check = False
+        for obj in non_null_object_names:
+            if str(keys).upper() in obj['name']:
+                existing_check=True
+        if existing_check:
+            continue
+        else:
+            non_null_object_names.append({"count":1,"name":str(keys)})
+    logger.info("## CUSTOM SOSQL OBJECT - present")
+except s3_resource.meta.client.exceptions.NoSuchKey as err :
+    logger.info("## CUSTOM SOSQL OBJECT - Not present - {0}".format(str(err)))
+'''
+Check if relational sosql calls are present.
+'''
+try:
+    custom_relql_data_obj = s3_resource.Object(object_loc_admin_bucket,custom_call_relql)
+    pre_customrelql_object_names = ast.literal_eval(custom_relql_data_obj.get()['Body'].read().decode('utf-8'))
+    customrelql_object_names = dict((k.upper(), v) for k,v in pre_customrelql_object_names.items())
+    logger.info("## CUSTOM REL QL OBJECT - present")
+except s3_resource.meta.client.exceptions.NoSuchKey as err :
+    logger.info("## CUSTOM REL QL OBJECT - Not present - {0}".format(str(err)))
+for current_object in non_null_object_names:
+    object_name = current_object['name']
+    columns=[]
+    if flag_object:
+        if single_object_name != object_name:
+            continue
+    if flag_lexi_object:
+        if object_name in lexi_object_names:
+            print("Lexi")
+            ##ADD THE LEXI PLUGIN
+    logger.info("Processing Object - {0}".format(str(object_name)))
+    if object_name in customsosql_object_names.keys():
+        custom_columns = customsosql_object_names.get("{0}".format(str(object_name)))
+        columns = [x.replace('toLabel(', '').replace(')', '') for x in custom_columns]
+        custom_columns.sort()
+    else:
+        try:
+            columns = grouped_df.iloc[object_names.tolist().index(str(object_name).lower())]
+        except ValueError:
+            print("Object {0} is not in the metadata fetch list".format(str(object_name).lower()))
+            continue
+    columns.sort()
+    if object_name in customrelql_object_names.keys():
+        api_sosql = "{0}{1}".format(str(sf_config_sosqlendpoint),str(customrelql_object_names[object_name]))
+    elif object_name in customsosql_object_names.keys():
+        api_sosql = "{0}".format(str(sf_config_sosqlendpoint)) + str("+,+".join(custom_columns)) + "+FROM+{0}".format(str(object_name))
+    else:
+        api_sosql = "{0}".format(str(sf_config_sosqlendpoint)) + str("+,+".join(columns)) + "+FROM+{0}".format(str(object_name))
+    active_mpp_requests = dydb_client.query(ExpressionAttributeValues={':v1': \
+        {'S': '{0}'.format(str(run_control_table_regionhash)),},}, \
+        KeyConditionExpression='REGIONHASH = :v1',TableName='{0}'.format(str(run_control_table)), Select='COUNT')
+    print(active_mpp_requests['Count'])
+    if (int(active_mpp_requests['Count'])<run_control_batchsize):
+            returncode = _API(str(api_sosql), str(object_name.upper()), instance_url, \
+            nexturl, token, s3_resource, columns, 'True' if object_name in customsosql_object_names.keys() else 'False', dydb_client, run_control_table_regionhash, \
+            object_loc_data_bucket, object_loc_data_bucket_key, run_control_table, run_child_lambda, \
+            run_control_logtable_hash, object_name)
+    else:
+        while True:
+            print("Batch has increased beyond SF Capability - Waiting for 10 Seconds")
+            time.sleep(10)
+            active_mpp_requests = dydb_client.query(ExpressionAttributeValues= \
+            {':v1': {'S': '{0}'.format(str(run_control_table_regionhash)),},}, \
+            KeyConditionExpression='REGIONHASH = :v1',TableName='{0}'.format(str(run_control_table)), Select='COUNT')
+            if (int(active_mpp_requests['Count'])<run_control_batchsize):
+                returncode = _API(str(api_sosql), str(object_name.upper()), instance_url, \
+                nexturl, token, s3_resource, columns, 'True' if object_name in customsosql_object_names.keys() else 'False', dydb_client, run_control_table_regionhash, \
+                object_loc_data_bucket, object_loc_data_bucket_key, run_control_table, run_child_lambda, \
+                run_control_logtable_hash, object_name)
+                break
+            else:
+                continue
+print("Sleeping for 20 and then checking for errored")
+time.sleep(20)
+print("Checking for failed records now")
+error_dict = {}
+log_requests = dydb_client.query(ExpressionAttributeValues={':v1':{'S': '{0}'.format(str(run_control_table_regionhash)),},},ExpressionAttributeNames={"#hash":"hash",},KeyConditionExpression='#hash = :v1',TableName='global-mpp-logtable', Select='COUNT')
+if (int(log_requests['Count']))>10:
+    while True:
+        print("Number of requests is still greater than 30 - will be sleeping for 20 seconds")
+        time.sleep(20)
+        log_requests = dydb_client.query(ExpressionAttributeValues={':v1':{'S': '{0}'.format(str(run_control_table_regionhash)),},},ExpressionAttributeNames={"#hash":"hash",},KeyConditionExpression='#hash = :v1',TableName='global-mpp-logtable', Select='COUNT')
+        if int(log_requests['Count'])==0:
+            print("All Data in the queue have been processed")
+            break
+        if (int(log_requests['Count'])<=50) and int(log_requests['Count'])>0:
+            response = dydb_logtable.query(KeyConditionExpression=Key('hash').eq('{0}'.format(str(run_control_table_regionhash))))
+            for item in response['Items']:
+                object_nm = item['objectName']
+                file_nm = item['function']
+                endtime = item['endTime']
+                if endtime < time.time():
+                    if object_nm not in error_dict:
+                        error_dict[object_nm] = []
+                    error_dict[object_nm].append('{0}'.format(str(file_nm)))
+                    delete_resp = dydb_client.delete_item(TableName='global-mpp-logtable',Key={'hash':{'S':'{0}'.format(str(run_control_table_regionhash))},'function':{'S':'{0}'.format(str(file_nm))}})
+        else:
+            continue
+#Send Success Response
+mail_table_df = pd.DataFrame(non_null_object_names)
+mail_table_html = mail_table_df.to_html()
+mail_object = s3_resource.Object(mail_template_bucket,mail_template_file)
+try:
+    _sendmail(mail_object, mail_table_html, "{2} Refresh Notification / Region {0} : {1}".format(str(run_region).upper(),str(run_env).upper(),str(run_project).upper()), event["email_recipients"])
+except :
+    print("SMTP Error")
+#send error
+if error_dict:
+    mail_error_object = s3_resource.Object(mail_template_bucket,mail_errortemplate_file)
+    try:
+        _sendmail(mail_error_object, str(error_dict), "{2} Refresh Error Notification / Region {0} : {1}".format(str(run_region).upper(),str(run_env).upper(),str(run_project).upper()), ['yrar@novonordisk.com','dmzb@novonordisk.com'])
+    except:
+        print("SMTP Error")
+#Add the details to the crawler
+try:
+    prefixlist=[]
+    prefixdict={}
+    glue_prefix = s3_client.list_objects(Bucket=object_loc_data_bucket, Prefix='{0}/csv/'.format(str(object_loc_data_bucket_key)), Delimiter='/')
+    for prefix in glue_prefix.get('CommonPrefixes'):
+        prefixdict={'Path': '{0}/{1}'.format('victoria-prd-eu-lambda',prefix.get('Prefix'))}
+        prefixlist.append(prefixdict)
+    crawl_client = boto3.client('glue',region_name='eu-central-1')
+    if flag_crawler:
+        crawl_client.update_crawler(Name='{0}'.format(str(custom_crawler_name)),Targets={'S3Targets': prefixlist})
+    else:
+        crawl_client.update_crawler(Name='victoria-prd-mpp-{0}-{1}'.format(str(run_env),str(run_region)),Targets={'S3Targets': prefixlist})
+except:
+    print("Crawler update error")
+try:
+    client = boto3.client('glue',region_name='eu-central-1')
+    s3 = boto3.client('s3')
+    crawler_name = 'victoria-prd-mpp-{0}-{1}'.format(str(run_env),str(run_region)) if run_project == 'ioengage' else 'data-ioccs-{0}-export-csv'.format(str(run_env))
+    meta_key = '{0}/meta/{1}/{2}/meta.csv'.format(str(run_project),str(run_region),str(run_env))
+    database_name = 'oce-{1}-{0}'.format(str(run_env),str(run_region)) if run_project == 'ioengage' else 'ioccs-{0}-export-{1}'.format(str(run_region),str(run_env))
+    if run_project in ['ioengage','ioccs']:
+        response = client.get_crawler(Name=crawler_name)
+        obj = s3.get_object(Bucket='victoria-prd-eu-lambda', Key=meta_key)
+        body = obj['Body']
+        csv_string = body.read().decode('utf-8')
+        df = pd.read_csv(StringIO(csv_string),delimiter="\t")
+        df['col_dict'] = df.apply(lambda row: {row['name']:row['type']}, axis=1)
+        df["object"] = df["object"].str.lower()
+        df_grouped = df.groupby('object')['col_dict'].apply(list)
+        update_column = []
+        for tables in response['Crawler']['Targets']['S3Targets']:
+            entity = tables['Path'].split('/')[-2]
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                os.system("aws s3api get-object --bucket victoria-prd-eu-lambda --range bytes=0-30000 --key {0}{1}.csv {2}/temp".format(str(tables['Path']).replace('s3://victoria-prd-eu-lambda/',''),str(entity),str(tmpdirname)))
+                try:
+                    file = open("{0}/temp".format(str(tmpdirname)),encoding="utf8")
+                except FileNotFoundError:
+                    print("Object data not present")
+                    continue
+                line = file.readline()
+                file.close()
+                line = line.rstrip()
+                line = line.replace('"','')
+                columns = re.split(r'\t+',line)
+                columns[0] = 'row_number'
+                columns_lower = [x.lower().replace('.','_').replace('tolabel(','').replace(')','') for x in columns]
+                try:
+                    meta_col = df_grouped.loc['{0}'.format(str(entity).lower())]
+                except KeyError:
+                    continue
+                update_column=[]
+                update_column.append({'Name': 'row_number', 'Type': 'bigint'})
+                for outer_col in columns_lower:
+                    meta_flag = False
+                    for col in meta_col:
+                        for key, val in col.items():
+                            if str(key).lower()==outer_col:
+                                meta_flag = True
+                                if val in ['boolean']:
+                                    update_column.append({'Name': outer_col, 'Type': str(val)})
+                                else:
+                                    update_column.append({'Name': outer_col, 'Type': 'string'})
+                    if not meta_flag and outer_col not in ['row_number']:
+                        update_column.append({'Name': outer_col, 'Type': 'string'})
+                tabl_resp = client.get_table(DatabaseName=database_name,Name='csv_{0}'.format(str(entity).lower()))
+                tabl_resp['Table']['StorageDescriptor']['Columns']=update_column
+                update_t = tabl_resp['Table']
+                update_t.pop('DatabaseName', None)
+                update_t.pop('CreateTime', None)
+                update_t.pop('UpdateTime', None)
+                update_t.pop('CreatedBy', None)
+                update_t.pop('IsRegisteredWithLakeFormation', None)
+                update_t.pop('CatalogId', None)
+                response = client.update_table(DatabaseName=database_name.format(str(run_env),str(run_region)),TableInput=update_t)
+except Exception as e:
+    print("Crawler field update error - {}".format(str(e)))
